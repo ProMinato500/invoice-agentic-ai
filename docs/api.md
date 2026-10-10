@@ -13,3 +13,11 @@ Interactive typed request schemas and actual endpoint descriptions are available
 - GET /health and /ready expose runtime state; GET /api/settings exposes non-secret configuration.
 
 Pagination uses `limit` and `offset`. SSE supports `after` and Last-Event-ID, with persisted microsecond sequence identifiers. Reports use `?format=pdf|csv|json` and return conflict if the current result version has no report. Review/correction requests return 409 when stale or processing. Unauthorized record IDs return 404. Malformed PDFs, passwords and unreadable extraction return explicit errors.
+
+## Inspectable agent outputs
+
+- GET /api/reconciliations/{id}/events/{event_id}/trace: full immutable public event output, scoped to the run/event owner; old events return an explicit historical fallback.
+- GET /api/documents/{id}/extraction: real raw parser JSON plus extraction metadata/version.
+- POST /api/reconciliations/{id}/reinspect: {version, document_id, page, bbox?}; queues a real source vision reading/new result version, never a hidden canonical overwrite.
+- POST /api/documents/{id}/verify-extraction: {version, note}; reviewer verification of source-backed canonical fields; leaves math failures intact and recomputes affected runs.
+- POST /api/reconciliations/{id}/allocation-review: {version, pieces:[{invoice_line_id, po_line_id, quantity}], note}; exact compatible-unit splits, scoped IDs, six decimal places, optimistic version checks and full ledger/financial recomputation.

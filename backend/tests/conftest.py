@@ -7,6 +7,7 @@ os.environ["DATABASE_URL"] = "sqlite:///" + str(
 ).replace("\\", "/")
 os.environ["STORAGE_PATH"] = tempfile.mkdtemp(prefix="reconcile-storage-")
 os.environ["PARSER"] = "pymupdf"
+os.environ["ENABLE_EMBEDDINGS"] = "false"
 os.environ["OPENAI_API_KEY"] = ""
 os.environ["INVOICE_AZURE_API_KEY"] = ""
 import pytest

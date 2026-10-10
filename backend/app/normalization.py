@@ -75,6 +75,40 @@ def attributes(text):
 def compare_constraint(expected, actual, operator="EQ"):
     if actual is None or actual == "":
         return "UNKNOWN"
+    if operator == "CONDITIONAL":
+        if not isinstance(expected, dict) or not isinstance(actual, dict):
+            return "UNKNOWN"
+        when = expected.get("when", {})
+        condition_value = actual.get(when.get("field"))
+        if condition_value is None:
+            return "UNKNOWN"
+        condition = compare_constraint(
+            when.get("value"), condition_value, when.get("operator", "EQ")
+        )
+        if condition == "UNKNOWN":
+            return "UNKNOWN"
+        if condition == "FAIL":
+            return "PASS"
+        then = expected.get("then", {})
+        return compare_constraint(
+            then.get("value"), actual.get(then.get("field")), then.get("operator", "EQ")
+        )
+    if operator == "APPROVED_EQUIVALENT":
+        if not isinstance(expected, dict) or not expected.get("authorization_evidence_ids"):
+            return "UNKNOWN"
+        return (
+            "PASS"
+            if identifier(str(actual)) in {identifier(str(x)) for x in expected.get("allowed", [])}
+            else "FAIL"
+        )
+    if operator == "CERTIFIED_TO":
+        # An explicit conflicting version fails; a matching label alone is not a certificate.
+        if not isinstance(actual, dict):
+            return "FAIL" if identifier(str(expected)) != identifier(str(actual)) else "UNKNOWN"
+        standards = actual.get("standards", [])
+        if identifier(str(expected)) not in {identifier(str(x)) for x in standards}:
+            return "FAIL"
+        return "PASS" if actual.get("certificate_evidence_ids") else "UNKNOWN"
     if operator == "MANDATORY_FEATURE":
         return (
             "PASS" if str(actual).lower() in ("true", "yes", "1", str(expected).lower()) else "FAIL"
@@ -94,7 +128,10 @@ def compare_constraint(expected, actual, operator="EQ"):
         )
     # Certifications, IP protection classes, model revisions and material grades require exact evidence.
     if re.match(r"^(IP|SS|AISI|ISO|IEC)", str(expected), re.I):
-        return "PASS" if identifier(str(expected)) == identifier(str(actual)) else "FAIL"
+        equal = identifier(str(expected)) == identifier(str(actual))
+        if operator not in {"EQ", "NEQ"}:
+            return "UNKNOWN"
+        return "PASS" if (not equal if operator == "NEQ" else equal) else "FAIL"
     try:
 
         def unit_text(value):
@@ -123,6 +160,8 @@ def compare_constraint(expected, actual, operator="EQ"):
             return "UNKNOWN"
         ev, av = Decimal(str(a.magnitude)), Decimal(str(b.to(a.units).magnitude))
     except Exception:
+        if operator not in {"EQ", "NEQ"}:
+            return "UNKNOWN"
         ev, av = str(expected).upper(), str(actual).upper()
     operations = {
         "EQ": lambda: av == ev,
@@ -154,7 +193,10 @@ def specs(po, inv, approved=False):
     findings = []
     for name, expected in po.attributes.items():
         actual = inv.attributes.get(name)
-        result = compare_constraint(expected, actual)
+        operator = expected.get("operator", "EQ") if isinstance(expected, dict) else "EQ"
+        required = expected.get("value") if isinstance(expected, dict) else expected
+        actual_value = actual.get("value") if isinstance(actual, dict) else actual
+        result = compare_constraint(required, actual_value, operator)
         if result != "PASS":
             findings.append(
                 {

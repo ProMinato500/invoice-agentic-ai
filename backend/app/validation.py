@@ -58,6 +58,15 @@ def validate(db, run_id):
             )
         )
 
+    for request in run.policy.get("agent_review_requests", []):
+        if request.get("version") == run.version:
+            issue("AGENT_REVIEW_REQUIRED", request["reason"], "review")
+    if run.policy.get("allocation_plan", {}).get("requires_review"):
+        issue(
+            "COMPLEX_ALLOCATION_REVIEW",
+            "A global split/ambiguous allocation plan is available. Verify product grouping and authorized mapping before committing capacity.",
+            "review",
+        )
     po_header = po_doc.extraction.get("header", {})
     po_lines = [line for line in lines.values() if line.document_id == run.po_id]
     po_subtotal = sum((number(line.amount) for line in po_lines), Decimal("0"))
@@ -276,7 +285,8 @@ def validate(db, run_id):
                 "review",
             )
         for warning in doc.extraction.get("warnings", []):
-            issue("EXTRACTION_WARNING", warning, "review")
+            if warning not in doc.extraction.get("reviewed_warnings", []):
+                issue("EXTRACTION_WARNING", warning, "review")
     for match in matches:
         inv = lines[match.invoice_line_id]
         match.findings = []
@@ -296,6 +306,121 @@ def validate(db, run_id):
                 match,
                 inv.evidence,
             )
+        split = [
+            p for p in run.policy.get("allocation_overrides", []) if p["invoice_line_id"] == inv.id
+        ]
+        if split and match.review_action == "allocation":
+            evidence = list(inv.evidence)
+            spec_states = []
+            qty_ok = sum((number(p["quantity"]) for p in split), Decimal(0)) == number(inv.quantity)
+            price_ok = True
+            for piece in split:
+                po = lines.get(piece["po_line_id"])
+                qty = number(piece["quantity"])
+                if (
+                    not po
+                    or po.document_id != run.po_id
+                    or qty <= 0
+                    or unit(po.unit) != unit(inv.unit)
+                ):
+                    qty_ok = False
+                    issue(
+                        "INVALID_ALLOCATION",
+                        "Split plan contains an unauthorized or incompatible edge.",
+                        "error",
+                        match,
+                        inv.evidence,
+                    )
+                    continue
+                evidence.extend(po.evidence)
+                spec_status, spec_findings = specs(po, inv)
+                spec_states.append(spec_status)
+                for finding in spec_findings:
+                    issue(
+                        finding["code"],
+                        finding["message"],
+                        finding["severity"],
+                        match,
+                        po.evidence + inv.evidence,
+                    )
+                if qty > number(po.quantity) - allocated[po.id]:
+                    qty_ok = False
+                    issue(
+                        "QUANTITY_OVERBILL",
+                        f"Split quantity {qty} exceeds PO line {po.line_no} remaining capacity.",
+                        "error",
+                        match,
+                        evidence,
+                    )
+                else:
+                    allocated[po.id] += qty
+                    pending.append((po, inv, qty))
+                if abs(number(inv.unit_price) - number(po.unit_price)) > max(
+                    abs(number(po.unit_price)) * tolerance, rounding
+                ):
+                    price_ok = False
+                    issue(
+                        "PRICE_MISMATCH",
+                        f"Split edge PO line {po.line_no} has a different authorized price.",
+                        "error",
+                        match,
+                        evidence,
+                    )
+                if number(po.tax_rate) != number(inv.tax_rate):
+                    issue(
+                        "TAX_RATE_REVIEW",
+                        "Split edges have differing tax rates.",
+                        "review",
+                        match,
+                        evidence,
+                    )
+                if number(po.discount) or number(inv.discount):
+                    issue(
+                        "SPLIT_DISCOUNT_REVIEW",
+                        "Split discount apportionment requires explicit verification.",
+                        "review",
+                        match,
+                        evidence,
+                    )
+            if not qty_ok:
+                issue(
+                    "INVALID_SPLIT_QUANTITY",
+                    "The split must exactly cover the invoice quantity within remaining PO capacities.",
+                    "error",
+                    match,
+                    evidence,
+                )
+            match.spec_status = (
+                "FAIL"
+                if "FAIL" in spec_states
+                else "UNKNOWN"
+                if "UNKNOWN" in spec_states or not spec_states
+                else "PASS"
+            )
+            match.quantity_status = "PASS" if qty_ok else "FAIL"
+            match.price_status = "PASS" if price_ok else "FAIL"
+            if (
+                abs(
+                    number(inv.quantity) * number(inv.unit_price)
+                    - number(inv.discount)
+                    - number(inv.amount)
+                )
+                > rounding
+                and "LINE_AMOUNT_MISMATCH" not in inv.flags
+            ):
+                issue(
+                    "LINE_AMOUNT_MISMATCH",
+                    "Split invoice extended amount does not reconcile.",
+                    "error",
+                    match,
+                    evidence,
+                )
+            match.findings = [
+                {"code": d.code, "severity": d.severity, "message": d.message}
+                for d in issues
+                if d.match_id == match.id
+            ]
+            continue
         if match.po_line_id is None:
             match.spec_status = "UNKNOWN"
             match.quantity_status = "UNKNOWN"
@@ -358,7 +483,7 @@ def validate(db, run_id):
             else:
                 match.quantity_status = "PASS"
                 allocated[po.id] += number(inv.quantity)
-                pending.append((po, inv))
+                pending.append((po, inv, number(inv.quantity)))
         if number(po.quantity) > 0:
             expected_discount = number(po.discount) * number(inv.quantity) / number(po.quantity)
             if abs(number(inv.discount) - expected_discount) > rounding:
@@ -420,14 +545,14 @@ def validate(db, run_id):
     )
     # Persist capacity only for fully validated runs. Review/blocked runs never consume stock.
     if outcome == "AUTO_APPROVABLE" and not run.policy.get("evaluation_id"):
-        for po, inv in pending:
+        for po, inv, qty in pending:
             db.add(
                 Allocation(
                     organization_id=run.organization_id,
                     run_id=run.id,
                     po_line_id=po.id,
                     invoice_line_id=inv.id,
-                    quantity=inv.quantity,
+                    quantity=qty,
                 )
             )
     db.add_all(issues)

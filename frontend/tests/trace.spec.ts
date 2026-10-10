@@ -1,0 +1,30 @@
+import {test,expect} from '@playwright/test';
+test('saved SSE output, OCR source selection, raw extraction and trace download',async({page,request})=>{
+ const errors:string[]=[];page.on('pageerror',e=>errors.push(e.message));
+ const listed=await (await request.get('/api/reconciliations?limit=100')).json();
+ let id='';
+ for(const r of listed.items){if(['PROCESSING','QUEUED','FAILED'].includes(r.status))continue;const e=await(await request.get(`/api/reconciliations/${r.id}/events`)).json();if(e.items.some((v:{status:string})=>v.status==='OCR_RESULT')){id=r.id;break;}}
+ expect(id).toBeTruthy();await page.goto(`/runs/${id}`);
+ await page.locator('.timeline-stage').filter({hasText:'extracting'}).first().locator('summary').click();
+ const ocr=page.locator('.stage-events > div').filter({hasText:'OCR RESULT'}).first();
+ await ocr.getByRole('button',{name:'View output',exact:true}).click();
+ await expect(page.getByRole('dialog')).toBeVisible();
+ await page.getByRole('button',{name:'ocr text',exact:true}).click();
+ await expect(page.locator('.trace-element').first()).toBeVisible();
+ await page.locator('.trace-element').first().click();
+ await expect(page.getByText('Highlighted source: page 1')).toBeVisible();
+ await expect.poll(()=>page.locator('canvas').evaluateAll(cs=>cs.filter(c=>(c as HTMLCanvasElement).width>100).length)).toBeGreaterThan(0);
+ await expect(page.locator('.pdf-canvas p')).toHaveCount(0,{timeout:30000});
+ await expect.poll(()=>page.locator('canvas').evaluateAll(cs=>cs.filter(c=>{const el=c as HTMLCanvasElement;const p=el.getContext('2d')!.getImageData(0,0,el.width,el.height).data;let dark=0;for(let i=0;i<p.length;i+=4)if(p[i]<200&&p[i+1]<200&&p[i+2]<200&&p[i+3])dark++;return dark>100;}).length)).toBeGreaterThan(0);
+ await page.screenshot({path:'../storage/browser-ocr-trace.png',fullPage:true});
+ await page.getByRole('button',{name:'canonical rows',exact:true}).click();
+ await expect(page.locator('.trace-json').last()).toContainText('description');
+ const saved=page.waitForEvent('download');await page.getByRole('button',{name:'Download trace',exact:true}).click();expect(await(await saved).failure()).toBeNull();
+ await page.getByRole('button',{name:'Close',exact:true}).click();
+ await page.getByRole('button',{name:'Inspect OCR & extraction',exact:true}).first().click();
+ await expect(page.locator('.trace-element').first()).toBeVisible();
+ await page.getByRole('button',{name:'raw parser',exact:true}).click();
+ await expect(page.locator('.trace-json')).toContainText('schema_name');
+ await page.reload();await expect(page.getByRole('heading',{name:'Execution timeline',exact:true})).toBeVisible();
+ expect(errors).toEqual([]);
+});

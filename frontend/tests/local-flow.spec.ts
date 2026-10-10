@@ -10,8 +10,12 @@ test('actual PDF upload, SSE, evidence, reviewer recomputation, reports and pers
   await expect(page.getByRole('button',{name:'invoice.pdf',exact:true})).toBeVisible();
   await page.getByRole('button',{name:'Start reconciliation',exact:true}).click();
   await expect(page).toHaveURL(/\/runs\/[a-f0-9-]+/);
+  const activeId=page.url().split('/').pop()!;
+  const live=await page.evaluate(async(id)=>{const control=new AbortController();const timer=setTimeout(()=>control.abort(),8000);try{const response=await fetch(`/api/reconciliations/${id}/stream`,{signal:control.signal});const reader=response.body!.getReader();const first=await reader.read();const second=await reader.read();return {ok:response.ok,bytes:(first.value?.length||0)+(second.value?.length||0)};}catch(e){return {ok:false,bytes:0};}finally{clearTimeout(timer);control.abort();}},activeId);
+  expect(live.ok).toBeTruthy();expect(live.bytes).toBeGreaterThan(0);
+  await expect(page.locator('.timeline-stage').filter({hasText:'extracting'}).first()).toBeVisible({timeout:30000});
   await expect(page.locator('.run-actions .badge')).toHaveText('blocked',{timeout:450000});
-  await expect(page.getByText('spec mismatch',{exact:true}).first()).toBeVisible();
+  await expect(page.getByText('spec mismatch',{exact:true}).first()).toBeVisible({timeout:30000});
   const runId=page.url().split('/').pop()!;
   const stream=await request.get(`/api/reconciliations/${runId}/stream`);
   expect(stream.ok()).toBeTruthy();expect(await stream.text()).toContain('event: settled');expect(await stream.text()).toContain('EXTRACTING');

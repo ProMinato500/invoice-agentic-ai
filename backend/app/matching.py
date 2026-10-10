@@ -1,11 +1,13 @@
 from sqlalchemy import select
 
-from backend.app.ai import structured
+from backend.app.ai import agent
 from backend.app.core.config import settings
 from backend.app.models import Line, Match
 from backend.app.normalization import identifier
+from backend.app.reports import serialize
 from backend.app.retrieval import candidates
 from backend.app.schemas import SemanticDecision
+from backend.app.tools import MATCH_TOOLS, dispatch
 
 
 def match_lines(db, run, emit):
@@ -61,7 +63,7 @@ def match_lines(db, run, emit):
                 selected = identical[0].id
                 status = "SAME_PRODUCT"
                 rationale = "Unique identical description with no contradictory SKU."
-            elif not group or group[0]["score"] < 0.45:
+            elif not group:
                 status = "NO_MATCH"
                 rationale = (
                     "No candidate has adequate retrieval evidence; no assignment was forced."
@@ -69,34 +71,29 @@ def match_lines(db, run, emit):
             elif settings.ai_configured and calls < settings.max_agent_tool_calls:
                 calls += 1
                 try:
-                    result = structured(
-                        "compare_candidates",
+
+                    def execute(name, args):
+                        result = dispatch(
+                            db, run.id, name, args.record_id, run.organization_id, args, emit
+                        )
+                        if name == "search_po_candidates":
+                            previous = {c["po_line_id"] for c in group}
+                            group.extend(c for c in result if c["po_line_id"] not in previous)
+                        return result
+
+                    result = agent(
+                        "matching",
                         {
-                            "invoice": {
-                                "id": inv.id,
-                                "description": inv.description,
-                                "sku": inv.sku,
-                                "attributes": inv.attributes,
-                                "evidence": inv.evidence,
-                            },
+                            "invoice": serialize(inv),
                             "candidates": group,
-                            "instruction": "Determine product correspondence separately from configuration compliance. Contradictory identifiers require uncertainty unless source evidence proves equivalence. NO_MATCH is allowed.",
+                            "instruction": "Use tools to inspect invoice and selected candidate source. A SAME_PRODUCT decision must cite evidence from BOTH invoice and the selected PO line. If retrieval wording differs, expand a search through the tool. Do not resolve bundles by forcing one product.",
                         },
                         SemanticDecision,
+                        MATCH_TOOLS,
+                        execute,
                         emit,
                     )
-                    allowed = {c["po_line_id"] for c in group}
-                    evidence_ids = {e["element_id"] for e in inv.evidence}
-                    for candidate in group:
-                        evidence_ids.update(e["element_id"] for e in candidate["evidence"])
-                    if result.po_line_id is not None and result.po_line_id not in allowed:
-                        raise ValueError(
-                            "Model returned a candidate outside the authorized candidate set"
-                        )
-                    if any(e not in evidence_ids for e in result.evidence_ids):
-                        raise ValueError("Model returned invalid evidence ID")
-                    if result.correspondence == "SAME_PRODUCT" and not result.evidence_ids:
-                        raise ValueError("Model claimed correspondence without source evidence")
+                    validate_semantic_decision(result, inv, group)
                     selected = result.po_line_id
                     status = result.correspondence
                     rationale = result.rationale
@@ -127,9 +124,43 @@ def match_lines(db, run, emit):
             group[0]["score"] if group else 0,
         )
         db.commit()
+        emit(
+            "MATCH_DECIDED",
+            f"Invoice line {inv.line_no}: {status}",
+            {
+                "invoice_line_id": inv.id,
+                "po_line_id": selected,
+                "identity_status": status,
+                "output": {
+                    "invoice_line": serialize(inv),
+                    "candidates": group,
+                    "decision": serialize(match),
+                },
+            },
+        )
         if index % 20 == 0 or index == len(invoices) - 1:
             emit(
                 "PROGRESS",
                 "Matched invoice lines",
                 {"processed": index + 1, "total": len(invoices), "ai_calls": calls},
             )
+
+
+def validate_semantic_decision(result, invoice, group):
+    selected = next((c for c in group if c["po_line_id"] == result.po_line_id), None)
+    invoice_ids = {e["element_id"] for e in invoice.evidence}
+    selected_ids = {e["element_id"] for e in selected["evidence"]} if selected else set()
+    allowed = invoice_ids | selected_ids
+    if any(e not in allowed for e in result.evidence_ids):
+        raise ValueError("Evidence does not belong to the invoice and selected candidate")
+    if result.correspondence in ("SAME_PRODUCT", "SAME_FAMILY"):
+        if (
+            not selected
+            or not invoice_ids.intersection(result.evidence_ids)
+            or not selected_ids.intersection(result.evidence_ids)
+        ):
+            raise ValueError(
+                "Correspondence requires selected candidate and bilateral source evidence"
+            )
+    if result.correspondence in ("NO_MATCH", "DIFFERENT") and result.po_line_id is not None:
+        raise ValueError("Unmatched decisions cannot carry an allocation candidate")

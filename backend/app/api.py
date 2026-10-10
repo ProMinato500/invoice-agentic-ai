@@ -38,10 +38,13 @@ from backend.app.models import (
 from backend.app.normalization import attributes, number
 from backend.app.reports import serialize
 from backend.app.schemas import (
+    AllocationReviewRequest,
     CorrectionRequest,
     EvaluationCreate,
+    ExtractionVerificationRequest,
     ReviewRequest,
     RunCreate,
+    VisionReviewRequest,
 )
 from backend.app.storage import store_pdf
 from backend.app.workflow import TERMINAL, emit
@@ -156,6 +159,13 @@ def configuration(org=Depends(auth)):
         "max_pages": settings.max_pages,
         "price_tolerance_percent": settings.default_price_tolerance_percent,
         "embedding_enabled": settings.enable_embeddings,
+        "embedding_provider": settings.embedding_provider,
+        "embedding_model": settings.local_embedding_model
+        if settings.embedding_provider == "local"
+        else settings.openai_embedding_model,
+        "agentic_roles": ["extraction_recovery", "matching", "specification", "exception"],
+        "ai_request_budget": settings.max_ai_requests_per_run,
+        "tool_call_budget": settings.max_agent_tool_calls,
         "api_docs": "http://127.0.0.1:8010/docs",
         "retention": "Documents retained locally until removed by the workspace owner. No automatic deletion.",
     }
@@ -428,7 +438,7 @@ async def stream(id: str, request: Request, after: int = 0, org=Depends(auth)):
             for payload in payloads:
                 cursor = payload["sequence"]
                 yield f"id: {cursor}\ndata: {json.dumps(payload, default=str)}\n\n"
-            if state in TERMINAL:
+            if state in TERMINAL and len(rows) < 500:
                 yield "event: settled\ndata: {}\n\n"
                 break
             yield ": heartbeat\n\n"
@@ -806,3 +816,212 @@ def review_history(id: str, db=Depends(db_session), org=Depends(auth)):
             )
         ]
     }
+
+
+@app.get("/api/reconciliations/{id}/events/{event_id}/trace")
+def event_trace(id: str, event_id: str, db=Depends(db_session), org=Depends(auth)):
+    owned(db, Run, id, org)
+    event = owned(db, Event, event_id, org)
+    if event.run_id != id:
+        raise HTTPException(404, "Trace not found in this run")
+    path = settings.storage / "traces" / event.run_id / (event.id + ".json")
+    if path.exists():
+        return json.loads(path.read_text(encoding="utf-8"))
+    return {
+        "stage": event.stage,
+        "status": event.status,
+        "message": event.message,
+        "version": event.data.get("version"),
+        "data": event.data,
+        "note": "This historical event predates detailed trace capture.",
+    }
+
+
+@app.get("/api/documents/{id}/extraction")
+def extraction_output(id: str, db=Depends(db_session), org=Depends(auth)):
+    doc = owned(db, Document, id, org)
+    path = settings.storage / "extractions" / (doc.id + ".json")
+    return {
+        "document_id": doc.id,
+        "version": doc.version,
+        "metadata": doc.extraction,
+        "raw": json.loads(path.read_text(encoding="utf-8")) if path.exists() else {},
+        "note": "Raw parser output is immutable; canonical corrections are versioned separately.",
+    }
+
+
+@app.post("/api/reconciliations/{id}/allocation-review")
+def allocation_review(
+    id: str, body: AllocationReviewRequest, db=Depends(db_session), org=Depends(auth)
+):
+    from collections import defaultdict
+    from decimal import Decimal
+
+    from backend.app.normalization import unit
+
+    db.execute(text("BEGIN IMMEDIATE"))
+    run = owned(db, Run, id, org)
+    if run.version != body.version or run.status in {"PROCESSING", "QUEUED"}:
+        raise HTTPException(409, "Run changed or is processing; refresh the allocation plan")
+    totals = defaultdict(lambda: Decimal(0))
+    pairs = set()
+    for piece in body.pieces:
+        inv = owned(db, Line, piece.invoice_line_id, org)
+        po = owned(db, Line, piece.po_line_id, org)
+        if (
+            inv.document_id not in run.invoice_ids
+            or po.document_id != run.po_id
+            or unit(inv.unit) != unit(po.unit)
+        ):
+            raise HTTPException(
+                422, "Allocation lines must belong to this run and have compatible units"
+            )
+        key = (inv.id, po.id)
+        if key in pairs:
+            raise HTTPException(422, "Duplicate allocation edge")
+        pairs.add(key)
+        totals[inv.id] += piece.quantity
+    for inv_id, qty in totals.items():
+        inv = owned(db, Line, inv_id, org)
+        if qty != number(inv.quantity):
+            raise HTTPException(422, "Split quantities must exactly cover the invoice line")
+        match = db.scalar(
+            select(Match).where(Match.run_id == run.id, Match.invoice_line_id == inv_id)
+        )
+        if not match:
+            raise HTTPException(422, "Invoice line has not been matched")
+        match.po_line_id = next(p.po_line_id for p in body.pieces if p.invoice_line_id == inv_id)
+        match.identity_status = "SAME_PRODUCT"
+        match.reviewed = 1
+        match.review_action = "allocation"
+        match.rationale = "Reviewer authorized split correspondence: " + body.note
+        match.version += 1
+    before = run.policy.get("allocation_overrides", [])
+    pieces = [p.model_dump(mode="json") for p in body.pieces]
+    run.policy = {**run.policy, "allocation_overrides": pieces, "allocation_review_note": body.note}
+    db.add(
+        Review(
+            organization_id=org,
+            run_id=run.id,
+            actor="local-reviewer",
+            action="allocation",
+            before={"pieces": before},
+            after={"pieces": pieces},
+            note=body.note,
+        )
+    )
+    db.commit()
+    queue(db, run)
+    return serialize(run)
+
+
+@app.post("/api/reconciliations/{id}/reinspect")
+def reinspect(id: str, body: VisionReviewRequest, db=Depends(db_session), org=Depends(auth)):
+    from backend.app.tools import render_region
+
+    if not settings.ai_configured or not settings.enable_vision_fallback:
+        raise HTTPException(422, "Configure AI and enable vision recovery first")
+    db.execute(text("BEGIN IMMEDIATE"))
+    run = owned(db, Run, id, org)
+    doc = owned(db, Document, body.document_id, org)
+    if doc.id not in [run.po_id] + run.invoice_ids + run.supporting_ids:
+        raise HTTPException(422, "Document does not belong to this run")
+    if run.version != body.version or run.status in {"PROCESSING", "QUEUED"}:
+        raise HTTPException(409, "Refresh the run before requesting recovery")
+    try:
+        render_region(doc, body.page, body.bbox)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    run.policy = {
+        **run.policy,
+        "source_reinspection": {
+            "document_id": doc.id,
+            "page": body.page,
+            "bbox": body.bbox,
+            "version": run.version + 1,
+        },
+    }
+    db.add(
+        Review(
+            organization_id=org,
+            run_id=run.id,
+            actor="local-reviewer",
+            action="source_reinspection",
+            before={},
+            after={"document_id": doc.id, "page": body.page, "bbox": body.bbox},
+            note="Requested actual AI source image reinspection; canonical facts remain unchanged.",
+        )
+    )
+    db.commit()
+    queue(db, run)
+    return serialize(run)
+
+
+@app.post("/api/documents/{id}/verify-extraction")
+def verify_extraction(
+    id: str, body: ExtractionVerificationRequest, db=Depends(db_session), org=Depends(auth)
+):
+    db.execute(text("BEGIN IMMEDIATE"))
+    doc = owned(db, Document, id, org)
+    if doc.version != body.version:
+        raise HTTPException(409, "Extraction version changed; refresh and inspect again")
+    affected = [
+        r
+        for r in db.scalars(select(Run).where(Run.organization_id == org))
+        if id in [r.po_id] + r.invoice_ids
+    ]
+    if any(r.status in {"PROCESSING", "QUEUED"} for r in affected):
+        raise HTTPException(409, "Wait for affected runs to finish before verifying")
+    lines = list(
+        db.scalars(select(Line).where(Line.document_id == id, Line.organization_id == org))
+    )
+    if not lines or any(not line.evidence for line in lines):
+        raise HTTPException(
+            422, "Canonical rows with source evidence are required before verification"
+        )
+    before = {
+        "version": doc.version,
+        "warnings": doc.extraction.get("warnings", []),
+        "flags": {line.id: line.flags for line in lines},
+    }
+    for line in lines:
+        line.flags = [
+            flag
+            for flag in line.flags
+            if not (
+                flag.startswith("UNVERIFIED_")
+                or flag
+                in {
+                    "AI_RECOVERY_REQUIRES_REVIEW",
+                    "AI_SPECIFICATION_REQUIRES_REVIEW",
+                    "AMOUNT_NOT_PRINTED",
+                }
+            )
+        ]
+    doc.version += 1
+    doc.extraction = {
+        **doc.extraction,
+        "reviewed_warnings": doc.extraction.get("warnings", []),
+        "verification": {
+            "actor": "local-reviewer",
+            "version": doc.version,
+            "note": body.note,
+            "at": now(),
+        },
+    }
+    for run in affected:
+        db.add(
+            Review(
+                organization_id=org,
+                run_id=run.id,
+                actor="local-reviewer",
+                action="extraction_verified",
+                before=before,
+                after={"document_id": doc.id, "version": doc.version},
+                note=body.note,
+            )
+        )
+    db.commit()
+    for run in affected:
+        queue(db, run)
+    return {"document": serialize(doc), "requeued_runs": [r.id for r in affected]}

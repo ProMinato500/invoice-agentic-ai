@@ -1,12 +1,14 @@
+import hashlib
 import json
 
 from rapidfuzz import fuzz
 from sqlalchemy import select, text
 
-from backend.app.ai import embed
+from backend.app.ai import embed, structured
 from backend.app.core.config import settings
 from backend.app.models import Line, SearchRecord
 from backend.app.normalization import identifier
+from backend.app.vectors import embedding_identity
 
 
 def rrf(rankings, k=60):
@@ -47,74 +49,111 @@ def index_po(db, document_id, org, emit):
             )
         )
     }
+    pending = []
     for line in lines:
-        if line.id not in records:
+        source_text = line.description + " " + line.sku + " " + json.dumps(line.attributes)
+        source_hash = hashlib.sha256(source_text.encode()).hexdigest()
+        record = records.get(line.id)
+        if record is None:
             record = SearchRecord(
                 organization_id=org,
                 line_id=line.id,
                 document_id=document_id,
-                search_text=line.description
-                + " "
-                + line.sku
-                + " "
-                + json.dumps(line.attributes)
-                + " "
-                + expand_description(line.description),
-                aliases=[
-                    {
-                        "text": expand_description(line.description),
-                        "method": "DETERMINISTIC_QUERY_NORMALIZATION",
-                        "authoritative": False,
-                    }
-                ]
-                if settings.enable_dual_augmentation
-                else [],
+                search_text=source_text,
+                aliases=[],
             )
             db.add(record)
             records[line.id] = record
-    for line in lines:
-        record = records[line.id]
-        current_text = (
-            line.description
-            + " "
-            + line.sku
-            + " "
-            + json.dumps(line.attributes)
-            + " "
-            + expand_description(line.description)
+        current_hash = next(
+            (a.get("source_hash") for a in record.aliases if a.get("source_hash")), None
         )
-        if record.search_text != current_text:
-            record.search_text = current_text
-            record.aliases = (
-                [
-                    {
-                        "text": expand_description(line.description),
-                        "method": "DETERMINISTIC_QUERY_NORMALIZATION",
-                        "authoritative": False,
-                    }
-                ]
-                if settings.enable_dual_augmentation
-                else []
-            )
+        if current_hash != source_hash:
+            record.aliases = [
+                {
+                    "text": expand_description(line.description),
+                    "method": "DETERMINISTIC_QUERY_NORMALIZATION",
+                    "source_hash": source_hash,
+                    "authoritative": False,
+                }
+            ]
             record.embedding = None
             record.embedding_model = None
-        if record.embedding_model and record.embedding_model != settings.openai_embedding_model:
-            record.embedding = None
-            record.embedding_model = None
+        if (
+            settings.enable_dual_augmentation
+            and settings.ai_configured
+            and not any(a.get("method") == "GENERATIVE_ALIAS" for a in record.aliases)
+        ):
+            pending.append(line)
+        record.search_text = source_text + " " + " ".join(a["text"] for a in record.aliases)
     db.commit()
+    if pending:
+        from backend.app.schemas import AliasBatch
+
+        for offset in range(0, len(pending), 20):
+            batch = pending[offset : offset + 20]
+            try:
+                result = structured(
+                    "po_search_aliases",
+                    {
+                        "lines": [
+                            {"line_id": line.id, "description": line.description, "sku": line.sku}
+                            for line in batch
+                        ],
+                        "instruction": "Generate up to three short purchasing terminology aliases per line. Preserve model/part identifiers. Do not invent specifications, brands or equivalences. Aliases are non-authoritative search aids only.",
+                    },
+                    AliasBatch,
+                    emit,
+                )
+                allowed = {line.id for line in batch}
+                if len({r.line_id for r in result.items}) != len(result.items) or any(
+                    r.line_id not in allowed for r in result.items
+                ):
+                    raise ValueError("Invalid augmentation line IDs")
+                for item in result.items:
+                    record = records[item.line_id]
+                    record.aliases = record.aliases + [
+                        {
+                            "text": value[:1000],
+                            "method": "GENERATIVE_ALIAS",
+                            "authoritative": False,
+                            "model": settings.invoice_azure_deployment or settings.openai_model,
+                        }
+                        for value in item.aliases[:3]
+                        if value.strip()
+                    ]
+                    record.search_text += " " + " ".join(
+                        a["text"] for a in record.aliases if a.get("method") == "GENERATIVE_ALIAS"
+                    )
+                db.commit()
+                emit(
+                    "ALIASES_GENERATED",
+                    "Generated PO retrieval aliases",
+                    {"count": len(result.items), "output": result.model_dump(mode="json")},
+                )
+            except Exception as exc:
+                emit(
+                    "WARNING",
+                    "Generative aliases unavailable; retained authoritative search",
+                    {"error": type(exc).__name__},
+                )
+                break
     if settings.enable_embeddings:
+        for record in records.values():
+            if record.embedding_model != embedding_identity():
+                record.embedding = None
+                record.embedding_model = None
         missing = [r for r in records.values() if r.embedding is None]
         for offset in range(0, len(missing), 64):
             batch = missing[offset : offset + 64]
             vectors = embed([r.search_text for r in batch])
             for record, vector in zip(batch, vectors):
                 record.embedding = vector
-                record.embedding_model = settings.openai_embedding_model
+                record.embedding_model = embedding_identity()
             db.commit()
             emit(
                 "COMPLETED",
                 "Embedded verified PO descriptions",
-                {"count": len(batch), "model": settings.openai_embedding_model},
+                {"count": len(batch), "model": embedding_identity()},
             )
     if db.bind.dialect.name == "sqlite":
         db.execute(

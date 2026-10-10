@@ -6,13 +6,13 @@ from functools import lru_cache
 from pathlib import Path
 
 import pymupdf as fitz
-from sqlalchemy import delete
+from sqlalchemy import delete, select
 
-from backend.app.ai import structured
 from backend.app.core.config import settings
 from backend.app.models import Document, Element, Line, uid
 from backend.app.normalization import attributes, number, unit
-from backend.app.schemas import CanonicalLine, ExtractedDocumentAI
+from backend.app.recovery import quality_gate, recover
+from backend.app.schemas import CanonicalLine
 
 for key in ("HF_HOME", "TORCH_HOME", "XDG_CACHE_HOME"):
     os.environ.setdefault(key, str(settings.storage / "model-cache"))
@@ -172,6 +172,45 @@ def native_header(text, kind):
 
 def extract_document(db, document: Document, emit):
     if document.state == "EXTRACTED":
+        from backend.app.reports import serialize
+
+        saved_elements = list(
+            db.scalars(
+                select(Element).where(
+                    Element.document_id == document.id,
+                    Element.organization_id == document.organization_id,
+                )
+            )
+        )
+        saved_lines = list(
+            db.scalars(
+                select(Line).where(
+                    Line.document_id == document.id,
+                    Line.organization_id == document.organization_id,
+                )
+            )
+        )
+        emit(
+            "OCR_RESULT",
+            "Using persisted parser output and current canonical version",
+            {
+                "document_id": document.id,
+                "cached": True,
+                "document_version": document.version,
+                "snapshot": {
+                    "elements": [serialize(e) for e in saved_elements],
+                    "canonical_lines": [serialize(line) for line in saved_lines],
+                    "header": document.extraction.get("header"),
+                    "warnings": document.extraction.get("warnings", []),
+                    "quality": document.extraction.get(
+                        "quality",
+                        {
+                            "note": "Historical extraction; inspect original source before certifying completeness"
+                        },
+                    ),
+                },
+            },
+        )
         return
     emit(
         "STARTED",
@@ -319,58 +358,50 @@ def extract_document(db, document: Document, emit):
     if not text.strip():
         text = "\n".join(e.raw_text for e in elements)
     header = native_header(text, document.kind)
-    # Schema-constrained normalization for layouts that deterministic table parsing cannot read.
-    if not canonical and settings.ai_configured and elements:
-        bounded = [{"id": e.id, "page": e.page, "text": e.raw_text} for e in elements[:400]]
-        result = structured(
-            "extract_document",
-            {
-                "kind": document.kind,
-                "elements": bounded,
-                "instruction": "Extract printed header and line fields. Supply supporting IDs for each row. Do not infer absent values. Numeric values must be decimal strings.",
-            },
-            ExtractedDocumentAI,
-            emit,
-        )
-        header = result.header.model_dump(mode="json")
-        known = {e.id: e for e in elements}
-        for row in result.lines:
-            if not row.evidence_ids or any(x not in known for x in row.evidence_ids):
-                raise ValueError(
-                    "INVALID_AI_EVIDENCE: extraction returned missing or unauthorized source IDs"
-                )
-            source = " ".join(known[x].raw_text for x in row.evidence_ids)
-            flags = []
-            # Monetary evidence must appear in supplied source; a model claim alone is insufficient.
-            source_values = set()
-            for token in re.findall(r"-?\d[\d,.]*", source):
-                try:
-                    source_values.add(number(token))
-                except ValueError:
-                    pass
-            for field in ("quantity", "unit_price", "amount"):
-                if number(getattr(row, field)) not in source_values:
-                    flags.append("UNVERIFIED_" + field.upper())
-            canonical.append(
-                CanonicalLine(
-                    line_no=len(canonical) + 1,
-                    description=row.description,
-                    sku=row.sku,
-                    quantity=number(row.quantity),
-                    unit=unit(row.unit),
-                    unit_price=number(row.unit_price),
-                    amount=number(row.amount),
-                    tax_rate=number(row.tax_rate or "0"),
-                    discount=number(row.discount or "0"),
-                    attributes={
-                        **attributes(row.description),
-                        **{a.name: a.value for a in row.attributes},
-                    },
-                    evidence_ids=row.evidence_ids,
-                    flags=flags,
-                )
+    quality = quality_gate(document, canonical, elements, header, warnings)
+    emit(
+        "QUALITY_CHECKED",
+        "Extraction completeness checked",
+        {"document_id": document.id, "output": quality},
+    )
+    recovery = []
+    if quality["recovery_required"] and document.kind in ("po", "invoice"):
+        if settings.ai_configured:
+            recovery, recovery_warnings = recover(
+                document, canonical, elements, header, quality, emit
             )
-        warnings.extend(result.warnings)
+            warnings.extend(recovery_warnings)
+        else:
+            warnings.append("EXTRACTION_COMPLETENESS_REVIEW: " + ", ".join(quality["reasons"]))
+    raw["recovery"] = recovery
+    raw["quality"] = quality
+    emit(
+        "OCR_RESULT",
+        "Parser text, tables and recovery readings available",
+        {
+            "document_id": document.id,
+            "parser": method,
+            "element_count": len(elements),
+            "snapshot": {
+                "elements": [
+                    {
+                        "id": e.id,
+                        "page": e.page,
+                        "bbox": e.bbox,
+                        "raw_text": e.raw_text,
+                        "method": e.method,
+                    }
+                    for e in elements
+                ],
+                "canonical_lines": [r.model_dump(mode="json") for r in canonical],
+                "header": header,
+                "quality": quality,
+                "recovery": recovery,
+                "warnings": warnings,
+            },
+            "raw": raw,
+        },
+    )
     if not canonical and document.kind in ("po", "invoice"):
         raise ValueError(
             "EXTRACTION_REVIEW_REQUIRED: no reliable item rows extracted. Enable standard Docling OCR / configure AI for this layout; no invented rows were created."
@@ -412,6 +443,8 @@ def extract_document(db, document: Document, emit):
         "parser": method,
         "pipeline": settings.docling_pipeline,
         "line_count": len(canonical),
+        "quality": quality,
+        "recovery_count": len(recovery),
         "raw_path": str(settings.storage / "extractions" / f"{document.id}.json"),
     }
     raw_path = Path(document.extraction["raw_path"])

@@ -95,3 +95,7 @@ The browser test needs the running API/worker/frontend. It creates unique fictio
 The full research brief is broader than this local implementation. Unverified equivalence is never assumed. Complex bundles/split allocations, automated amendment precedence, goods-receipt approval, inclusive/mixed-tax interpretation, authorized FX, cancellation/revision policies, conditional/certification standards, learned ranking, all corruption variants and 5000-line performance gates are not certified. Supporting PDFs are retained for human inspection and trigger review rather than silently authorizing changed terms. The current generated product catalog focuses on IT configurations; template names do not certify domain coverage.
 
 No payment is initiated. No arbitrary shell, file path or SQL tool is exposed to the AI. This is a functioning local review application, not a claim of universal extraction accuracy or production SaaS readiness.
+
+## Inspect execution during a demo
+
+See [demo guide](docs/demo-guide.md). Expand a run stage and click **View output** for OCR, AI/tool decisions, allocation or validation results. **Inspect OCR & extraction** opens source text beside the PDF. Page vision reinspection and reviewer verification create audited result versions.

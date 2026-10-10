@@ -1,3 +1,5 @@
+> Historical audit of the first implementation. The follow-up implementation adds real role-based function calling, bounded recovery/vision, local dense retrieval, generative aliases, solver plans, reviewed splits, guarded checkpoint resume and UI output traces. See [current implementation status](implementation-status.md), [agent details](agent-tools.md) and [demo guide](demo-guide.md). Original findings below are retained as history, not a description of the updated runtime.
+
 # AI and agentic integration audit
 
 Audited 11 October 2026 against docs/build-specification.md and the running local application. This is an implementation audit, not a certification of unseen-document accuracy.
