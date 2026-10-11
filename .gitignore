@@ -12,3 +12,10 @@ test-results/
 playwright-report/
 *.log
 *.tsbuildinfo
+
+# Presentation script and demo materials
+/docs/five-minute-demo-script.md
+/docs/demo-guide.md
+/docs/reconcileai-architecture.drawio
+/docs/architecture/
+/scripts/build_architecture_diagrams.py
