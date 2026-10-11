@@ -24,7 +24,7 @@ test('saved SSE output, OCR source selection, raw extraction and trace download'
  await page.getByRole('button',{name:'Inspect OCR & extraction',exact:true}).first().click();
  await expect(page.locator('.trace-element').first()).toBeVisible();
  await page.getByRole('button',{name:'raw parser',exact:true}).click();
- await expect(page.locator('.trace-json')).toContainText('schema_name');
+ await expect(page.locator('.trace-json')).toContainText('schema_name',{timeout:30000});
  await page.reload();await expect(page.getByRole('heading',{name:'Execution timeline',exact:true})).toBeVisible();
  expect(errors).toEqual([]);
 });

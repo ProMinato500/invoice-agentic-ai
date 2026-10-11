@@ -106,6 +106,8 @@ def test_review_correction_recompute(client):
         },
     )
     assert review.status_code == 200, review.text
+    assert client.get(f"/api/reconciliations/{rid}").json()["version"] == 1
+    assert client.post(f"/api/reconciliations/{rid}/recalculate").status_code == 200
     process_run(rid)
     run = client.get(f"/api/reconciliations/{rid}").json()
     assert run["version"] == 2 and run["outcome"] == "AUTO_APPROVABLE"
@@ -123,6 +125,7 @@ def test_review_correction_recompute(client):
         },
     )
     assert result.status_code == 200, result.text
+    assert client.post(f"/api/reconciliations/{rid}/recalculate").status_code == 200
     process_run(rid)
     assert client.get(f"/api/reconciliations/{rid}").json()["outcome"] == "BLOCKED"
     assert client.get(f"/api/elements/{element['id']}").json()["raw_text"] == element["raw_text"]
@@ -291,3 +294,59 @@ def test_charge_safeguards(client, case, code):
         d["code"] for d in client.get(f"/api/reconciliations/{rid}/discrepancies").json()["items"]
     ]
     assert code in codes
+
+
+def test_batch_reviews_and_corrections_persist_until_one_recompute(client):
+    rid, _ = create(client, "happy_path")
+    matches = client.get(f"/api/reconciliations/{rid}/matches").json()["items"]
+    for match in matches[:2]:
+        response = client.post(
+            f"/api/matches/{match['id']}/review",
+            json={
+                "action": "accept",
+                "version": match["version"],
+                "note": "Verified source correspondence for batch review.",
+            },
+        )
+        assert response.status_code == 200, response.text
+    match = matches[0]
+    evidence = match["invoice_line"]["evidence"][0]
+    element = client.get(f"/api/elements/{evidence['element_id']}").json()
+    response = client.post(
+        f"/api/elements/{element['id']}/correct",
+        json={
+            "line_id": match["invoice_line"]["id"],
+            "field": "quantity",
+            "value": str(match["invoice_line"]["quantity"]),
+            "version": element["version"],
+            "note": "Verified printed quantity; save with other reviews.",
+        },
+    )
+    assert response.status_code == 200, response.text
+    pending = client.get(f"/api/reconciliations/{rid}").json()
+    assert pending["version"] == 1
+    assert pending["status"] == "COMPLETED"
+    assert pending["outcome"] == "REVIEW_REQUIRED"
+    assert pending["pending_review_count"] == 3
+    assert not pending["report_available"]
+    assert client.get(f"/api/reconciliations/{rid}/report?format=json").status_code == 409
+    assert len(client.get(f"/api/reconciliations/{rid}/reviews").json()["items"]) == 3
+    stale = client.post(
+        f"/api/matches/{match['id']}/review",
+        json={
+            "action": "accept",
+            "version": match["version"],
+            "note": "Stale cached review must fail.",
+        },
+    )
+    assert stale.status_code == 409
+    queued = client.post(f"/api/reconciliations/{rid}/recalculate")
+    assert queued.status_code == 200
+    assert queued.json()["version"] == 2
+    assert queued.json()["policy"]["applied_review_count"] == 3
+    assert client.get(f"/api/reconciliations/{rid}").json()["pending_review_count"] == 0
+    assert client.post(f"/api/reconciliations/{rid}/recalculate").status_code == 409
+    process_run(rid)
+    complete = client.get(f"/api/reconciliations/{rid}").json()
+    assert complete["version"] == 2 and complete["outcome"] == "AUTO_APPROVABLE"
+    assert complete["report_available"]

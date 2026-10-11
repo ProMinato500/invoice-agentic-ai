@@ -77,3 +77,35 @@ Final live acceptance: semantic_alias run 1025d972-b075-406b-89e9-3ab340b83973 e
 Final live browser review run 258b2eec-66fd-426c-90fb-6cdbf4acacc9 completed at version 2 after a documented synthetic substitution. Backend/database/worker returned healthy checks, embeddings were enabled and no jobs remained active. The one failed pre-fix recovery attempt remains in history for audit; it was not deleted or reported as a successful case.
 
 The SSE follow-up also fixed intermediate-outcome presentation: PROCESSING/QUEUED stays visible until the run settles. A dedicated uncompressed streaming route plus durable backend polling keeps timeline, line results and findings current during model investigations. Event sequence allocation is serialized locally to preserve replay ordering across writers.
+
+
+## Table context and commercial row repair
+
+Recovery now receives complete table rows with repeated headers, merged-cell spans, source IDs, title/type hints, document metadata and explicit material/line identifier links. Adjacent-page matching headers are continuation hints; missing headers retain unverified suggestions and require vision/review. Type hints are advisory. Delivery, tax and payment tables cannot contribute priced rows through their cited table cells. Duplicate source blocks wholly inside table regions are excluded from loose-text recovery chunks.
+
+The Tables tab reconstructs saved parser grids and highlights clicked source cells. Historical traces without table snapshots explicitly show current saved-parser context. Native tables highlight row rectangles. Historical Docling cells are grounded by text plus page geometry; ambiguous cells remain unlinked.
+
+Commercial header support includes Material Code, Product / Service Description, Description of Goods, percentage discounts and Taxable Value. Taxable Value / Net Amount take priority over tax-inclusive Amount. Percentage discounts are normalized to currency with Decimal arithmetic. No printed amount is replaced by a model estimate.
+
+Refresh structured rows & recompute calls a versioned, audited refresh endpoint for the selected run's documents. It preserves original files, saved parser output and line IDs; adds missing rows, protects reviewed/allocated/corrected rows, retains ambiguity warnings and queues a new run version. Earlier trace/report artifacts remain preserved. Existing warnings and uncertain metadata still require review. Identifier links are correspondence hints, not authorization to overwrite delivery quantities or pricing.
+
+
+Validation for the table update: 62 backend tests pass, including chunk/header/span grounding, supporting-table rejection, historical repeated-cell geometry, commercial percentage/net-amount parsing, protected edits and versioned audit refresh. The actual four-page PO initially exposed only two canonical rows; its saved-table refresh recovered 20 items. All eight invoice items now map to the correct SKU and source page, with genuine price/quantity errors and unresolved metadata/specification checks still visible. Acceptance evidence is saved at storage/table-refresh-acceptance.json. PDF rendering now uses stable evidence content so background query refreshes cannot continually cancel a source render.
+
+
+Final browser validation: three Playwright workflows pass (OCR/SSE trace inspection and download, reconstructed table source selection, and linked PO/invoice page highlighting). Production build and TypeScript checks pass. Browser screenshots are saved in storage/browser-table-trace.png, storage/browser-linked-items.png and storage/browser-ocr-trace.png.
+
+
+## Batched human reviews
+
+Mapping reviews, canonical corrections, split authorizations and source verification now save immediately with audit records and mark affected runs pending, without queuing the worker. Run details expose pending_review_count; the UI displays a persistent banner and one Recompute saved reviews button. Pending results have REVIEW_REQUIRED outcome and current report downloads are blocked until recomputation. Shared-document changes mark each affected run pending. The existing recalculate endpoint serializes the queue operation, applies the whole saved batch and creates one new result version. Stale review versions, processing-time edits and duplicate queued recomputations remain rejected. Raw sources and prior report artifacts remain preserved.
+
+Validation: all 64 backend tests pass, including multiple saved reviews plus a correction, durable pending state, report blocking, stale-save rejection and one version increment for the batch. Production build and TypeScript checks pass.
+
+The live Playwright workflow also passes with unique demo PDFs: save two reviews, reload pending changes, keep stale reports disabled, recompute once, assert version 2 and both applied reviews, download PDF/CSV/JSON reports, and verify navigation and browser errors. Reused invoice fixtures correctly remain blocked by duplicate-allocation checks.
+
+## Interface refinement
+
+Navy navigation and blue actions replace the green interface theme; semantic result badges retain their existing colors. The sidebar contains Overview, New reconciliation, Runs and Documents, with Settings in the header. Environment and profile labels and token-entry controls are removed. The browser title is ReconcileAI. The overview adds a document illustration and refined cards without fabricated metrics. Upload limits and the initial price tolerance are read from server settings; unavailable totals show an em dash. Evaluation scenarios require explicit selection. Dashboard counts remain sourced from the database.
+
+Validation: production build and TypeScript pass. Live browser checks verify the title, four navigation entries, dashboard count equality with the API, unchanged green result badges, settings without password controls, all main pages at desktop/mobile sizes, no horizontal page overflow and no browser errors. Visual screenshots: storage/ui-navy-overview.png, storage/ui-navy-run.png and storage/ui-navy-mobile.png.

@@ -13,6 +13,7 @@ from backend.app.models import Document, Element, Line, uid
 from backend.app.normalization import attributes, number, unit
 from backend.app.recovery import quality_gate, recover
 from backend.app.schemas import CanonicalLine
+from backend.app.table_context import build_tables, finish_table, table_kind
 
 for key in ("HF_HOME", "TORCH_HOME", "XDG_CACHE_HOME"):
     os.environ.setdefault(key, str(settings.storage / "model-cache"))
@@ -64,6 +65,7 @@ ALIASES = {
         "part number",
         "item code",
         "product code",
+        "material code",
         "item",
     ),
     "description": (
@@ -73,12 +75,15 @@ ALIASES = {
         "details",
         "particulars",
         "service",
+        "product / service description",
+        "description of goods",
     ),
     "quantity": ("qty", "quantity", "billed qty", "ordered qty"),
     "unit": ("unit", "uom", "units"),
     "unit_price": ("unit price", "price", "rate", "unit cost"),
-    "amount": ("amount", "total", "line total", "net amount", "extended amount"),
+    "amount": ("amount", "total", "line total", "net amount", "extended amount", "taxable value"),
     "tax_rate": ("tax %", "tax rate", "gst %", "vat %"),
+    "discount_rate": ("disc %", "discount %", "discount percent"),
     "discount": ("discount", "discount amount"),
 }
 
@@ -89,6 +94,10 @@ def header_map(cells):
         v = re.sub(r"\s+", " ", str(raw or "")).strip().lower().rstrip(".")
         for name, aliases in ALIASES.items():
             if v in aliases:
+                if name == "amount" and name in mapping:
+                    prior = re.sub(r"\s+", " ", str(cells[mapping[name]] or "")).strip().lower()
+                    if prior in ("taxable value", "net amount"):
+                        continue
                 mapping[name] = col
     return mapping
 
@@ -122,6 +131,12 @@ def parse_table(rows, row_evidence, start):
             q, p = number(get("quantity")), number(get("unit_price"))
             printed = get("amount")
             flags = [] if printed else ["AMOUNT_NOT_PRINTED"]
+            discount = number(get("discount", "0"))
+            if "discount_rate" in mapping:
+                percentage = number(get("discount_rate", "0"))
+                if not 0 <= percentage <= 100:
+                    raise ValueError("Invalid discount percentage")
+                discount = (q * p * percentage / 100).quantize(Decimal(".01"))
             output.append(
                 CanonicalLine(
                     line_no=start + len(output),
@@ -130,9 +145,9 @@ def parse_table(rows, row_evidence, start):
                     quantity=q,
                     unit=unit(get("unit", "EA")),
                     unit_price=p,
-                    amount=number(printed) if printed else q * p,
+                    amount=number(printed) if printed else q * p - discount,
                     tax_rate=number(get("tax_rate", "0")),
-                    discount=number(get("discount", "0")),
+                    discount=discount,
                     attributes=attributes(desc),
                     evidence_ids=row_evidence.get(index, []),
                     flags=flags,
@@ -190,6 +205,11 @@ def extract_document(db, document: Document, emit):
                 )
             )
         )
+        saved_path = settings.storage / "extractions" / f"{document.id}.json"
+        saved_raw = (
+            json.loads(saved_path.read_text(encoding="utf-8")) if saved_path.exists() else {}
+        )
+        saved_tables = build_tables(saved_raw, saved_elements)
         emit(
             "OCR_RESULT",
             "Using persisted parser output and current canonical version",
@@ -199,6 +219,7 @@ def extract_document(db, document: Document, emit):
                 "document_version": document.version,
                 "snapshot": {
                     "elements": [serialize(e) for e in saved_elements],
+                    "tables": saved_tables,
                     "canonical_lines": [serialize(line) for line in saved_lines],
                     "header": document.extraction.get("header"),
                     "warnings": document.extraction.get("warnings", []),
@@ -265,7 +286,38 @@ def extract_document(db, document: Document, emit):
                     )
                     elements.append(element)
                     refs[i] = [element.id]
-                tables.append((rows, refs))
+                native = {
+                    "id": f"native-{page_num}-{len(raw.get('_native_table_context', [])) + 1}",
+                    "page": page_num,
+                    "title": "",
+                    "num_rows": len(rows),
+                    "num_cols": max((len(r) for r in rows), default=0),
+                    "cells": [],
+                    "source_granularity": "row_rectangle",
+                }
+                for r, values in enumerate(rows):
+                    for c, value in enumerate(values):
+                        native["cells"].append(
+                            {
+                                "row": r,
+                                "col": c,
+                                "row_span": 1,
+                                "col_span": 1,
+                                "column_header": False,
+                                "row_header": False,
+                                "text": str(value or ""),
+                                "evidence_ids": refs[r],
+                                "bbox": list(table.rows[r].bbox),
+                                "page": page_num,
+                            }
+                        )
+                raw.setdefault("_native_table_context", []).append(finish_table(native))
+                if table_kind("", [str(c or "") for row in rows[:3] for c in row]) not in (
+                    "delivery_schedule",
+                    "tax_summary",
+                    "payment_schedule",
+                ):
+                    tables.append((rows, refs))
         # Preserve Docling cells and convert bottom-origin coordinates to top-origin PDF points.
         for table in raw.get("tables", []):
             data = table.get("data", {})
@@ -315,9 +367,14 @@ def extract_document(db, document: Document, emit):
                     )
                     elements.append(element)
                     refs.setdefault(r, []).append(element.id)
+                    cell["_evidence_id"] = element.id
             # Prefer the primary parser's structured tables when it yields canonical rows.
             parsed, _ = parse_table(rows, refs, 1)
-            if parsed:
+            if parsed and table_kind("", [str(c or "") for row in rows[:3] for c in row]) not in (
+                "delivery_schedule",
+                "tax_summary",
+                "payment_schedule",
+            ):
                 if not raw.get("_canonical_tables_found"):
                     tables = []
                     raw["_canonical_tables_found"] = True
@@ -358,7 +415,9 @@ def extract_document(db, document: Document, emit):
     if not text.strip():
         text = "\n".join(e.raw_text for e in elements)
     header = native_header(text, document.kind)
-    quality = quality_gate(document, canonical, elements, header, warnings)
+    table_context = build_tables(raw, elements)
+    raw["_table_context_version"] = 1
+    quality = quality_gate(document, canonical, elements, header, warnings, tables=table_context)
     emit(
         "QUALITY_CHECKED",
         "Extraction completeness checked",
@@ -368,7 +427,7 @@ def extract_document(db, document: Document, emit):
     if quality["recovery_required"] and document.kind in ("po", "invoice"):
         if settings.ai_configured:
             recovery, recovery_warnings = recover(
-                document, canonical, elements, header, quality, emit
+                document, canonical, elements, header, quality, emit, tables=table_context
             )
             warnings.extend(recovery_warnings)
         else:
@@ -393,6 +452,7 @@ def extract_document(db, document: Document, emit):
                     }
                     for e in elements
                 ],
+                "tables": table_context,
                 "canonical_lines": [r.model_dump(mode="json") for r in canonical],
                 "header": header,
                 "quality": quality,
@@ -461,4 +521,141 @@ def extract_document(db, document: Document, emit):
             "warnings": warnings,
             "parser": method,
         },
+    )
+
+
+def refresh_saved_tables(db, document):
+    """Reparse saved tables while retaining line IDs, originals and protected edits."""
+    from backend.app.models import Allocation, Match
+    from backend.app.reports import serialize
+
+    path = settings.storage / "extractions" / f"{document.id}.json"
+    if not path.exists():
+        return {"document_id": document.id, "changed": False, "reason": "No saved tables"}
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    elements = list(
+        db.scalars(
+            select(Element).where(
+                Element.document_id == document.id,
+                Element.organization_id == document.organization_id,
+            )
+        )
+    )
+    known = {e.id: e for e in elements}
+    tables = build_tables(raw, elements)
+    existing = list(
+        db.scalars(select(Line).where(Line.document_id == document.id).order_by(Line.line_no))
+    )
+    protected = {e.id for e in elements if e.normalized_value is not None}
+    changes, warnings = [], []
+    assigned = set()
+    maximum = max((r.line_no for r in existing), default=0)
+    for table in tables:
+        if (
+            table["type_hint"] in ("delivery_schedule", "tax_summary", "payment_schedule")
+            or table["header_basis"] == "missing"
+        ):
+            continue
+        rows = [table["columns"]]
+        refs = {}
+        for row in table["rows"]:
+            values = [""] * table["num_cols"]
+            ids = []
+            for cell in row["cells"]:
+                values[cell["col"]] = cell["text"]
+                ids.extend(cell["evidence_ids"])
+            refs[len(rows)] = list(dict.fromkeys(ids))
+            rows.append(values)
+        parsed, issues = parse_table(rows, refs, 1)
+        warnings.extend(issues)
+        for candidate in parsed:
+            if not candidate.evidence_ids or any(i not in known for i in candidate.evidence_ids):
+                warnings.append("TABLE_REFRESH_MISSING_EVIDENCE")
+                continue
+            matching = [
+                line
+                for line in existing
+                if candidate.sku and line.sku == candidate.sku and line.id not in assigned
+            ]
+            if not candidate.sku:
+                matching = [
+                    line
+                    for line in existing
+                    if line.description == candidate.description and line.id not in assigned
+                ]
+            if len(matching) > 1:
+                warnings.append("TABLE_REFRESH_AMBIGUOUS_EXISTING_ROW")
+                continue
+            line = matching[0] if matching else None
+            if line and (
+                any(e["element_id"] in protected for e in line.evidence)
+                or db.scalar(
+                    select(Allocation.id).where(
+                        (Allocation.po_line_id == line.id) | (Allocation.invoice_line_id == line.id)
+                    )
+                )
+                or db.scalar(
+                    select(Match.id).where(
+                        ((Match.po_line_id == line.id) | (Match.invoice_line_id == line.id))
+                        & (Match.reviewed == 1)
+                    )
+                )
+            ):
+                warnings.append("TABLE_REFRESH_PRESERVED_PROTECTED_ROW:" + line.id)
+                continue
+            evidence = [
+                {
+                    "element_id": i,
+                    "document_id": document.id,
+                    "page": known[i].page,
+                    "bbox": known[i].bbox,
+                    "raw_text": known[i].raw_text,
+                }
+                for i in candidate.evidence_ids
+            ]
+            data = candidate.model_dump(exclude={"evidence_ids", "line_no"}, mode="python")
+            if abs(
+                candidate.quantity * candidate.unit_price - candidate.discount - candidate.amount
+            ) > Decimal(settings.rounding_tolerance):
+                data["flags"].append("LINE_AMOUNT_MISMATCH")
+            before = serialize(line) if line else {}
+            if line is None:
+                maximum += 1
+                line = Line(
+                    organization_id=document.organization_id,
+                    document_id=document.id,
+                    line_no=maximum,
+                    evidence=evidence,
+                    **data,
+                )
+                db.add(line)
+                db.flush()
+                existing.append(line)
+            else:
+                for key, value in data.items():
+                    setattr(line, key, value)
+                line.evidence = evidence
+            assigned.add(line.id)
+            changes.append({"before": before, "after": serialize(line), "table_id": table["id"]})
+    if changes:
+        document.version += 1
+        document.extraction = {
+            **document.extraction,
+            "line_count": len(existing),
+            "table_context_version": 1,
+            "table_refresh_warnings": warnings,
+            "source_verification": None,
+        }
+    return json.loads(
+        json.dumps(
+            {
+                "document_id": document.id,
+                "changed": bool(changes),
+                "changes": changes,
+                "warnings": warnings,
+                "line_count": len(existing),
+                "version": document.version,
+            },
+            default=str,
+        )
     )

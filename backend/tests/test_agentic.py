@@ -282,6 +282,7 @@ def test_authorized_split_rechecks_financials_and_capacity(client):
     assert response.status_code == 200, response.text
     from backend.app.workflow import process_run
 
+    assert client.post(f"/api/reconciliations/{rid}/recalculate").status_code == 200
     process_run(rid)
     run = client.get(f"/api/reconciliations/{rid}").json()
     assert run["outcome"] == "AUTO_APPROVABLE", client.get(
@@ -363,7 +364,8 @@ def test_verification_preserves_math_failures_and_audit(client):
         line = db.scalar(select(Line).where(Line.document_id == docs["invoice"]["id"]))
         assert line.flags == ["LINE_AMOUNT_MISMATCH"]
         assert db.get(Document, docs["invoice"]["id"]).version == 2
-        assert db.get(Run, rid).version == 2
+        assert db.get(Run, rid).version == 1
+        assert db.get(Run, rid).policy["pending_review_count"] == 1
     assert client.get(f"/api/reconciliations/{rid}/reviews").json()["items"]
 
 
@@ -403,3 +405,52 @@ def test_agent_allocation_tool_respects_evaluation_isolation(client):
         run.policy = {}
         db.commit()
         assert dispatch(db, other, "get_previous_allocations", po.id, "local", emit=lambda *a: None)
+
+
+def test_finding_audit_returns_source_documents_and_scoped_citations(client):
+    rid, docs = create(client, "price_mismatch")
+    findings = client.get(f"/api/reconciliations/{rid}/discrepancies").json()["items"]
+    finding = next(f for f in findings if f["match_id"])
+    result = client.post(f"/api/discrepancies/{finding['id']}/investigate")
+    assert result.status_code == 200, result.text
+    data = result.json()
+    assert data["citation_status"] == "SOURCE_CITATIONS_AVAILABLE"
+    assert {d["id"] for d in data["documents"]} == {docs["po"]["id"], docs["invoice"]["id"]}
+    assert {e["document_id"] for e in data["source_evidence"]} == {
+        docs["po"]["id"],
+        docs["invoice"]["id"],
+    }
+    assert client.get(f"/api/reconciliations/{rid}").json()["version"] == 1
+
+    from backend.app.models import Discrepancy
+
+    with Session() as db:
+        element = db.scalar(select(Element).where(Element.document_id == docs["po"]["id"]))
+        cite = Discrepancy(
+            run_id=rid,
+            code="AGENT_REVIEW_REQUIRED",
+            severity="review",
+            message=f"Printed requirement has source {element.id}",
+            evidence=[],
+        )
+        empty = Discrepancy(
+            run_id=rid,
+            code="EXTRACTION_WARNING",
+            severity="review",
+            message="Source reading unresolved",
+            evidence=[],
+        )
+        db.add_all([cite, empty])
+        db.commit()
+        cited_id, empty_id, element_id = cite.id, empty.id, element.id
+    cited = client.post(f"/api/discrepancies/{cited_id}/investigate").json()
+    assert any(e["element_id"] == element_id for e in cited["source_evidence"])
+    empty = client.post(f"/api/discrepancies/{empty_id}/investigate").json()
+    assert empty["citation_status"] == "NO_SPECIFIC_SOURCE_CITATION"
+    assert empty["source_evidence"] == []
+    assert len(empty["documents"]) == 2
+    with Session() as db:
+        db.get(Element, element_id).organization_id = "another-tenant"
+        db.commit()
+    isolated = client.post(f"/api/discrepancies/{cited_id}/investigate").json()
+    assert isolated["source_evidence"] == []

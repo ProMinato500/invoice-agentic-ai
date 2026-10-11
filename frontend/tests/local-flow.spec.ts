@@ -29,9 +29,25 @@ test('actual PDF upload, SSE, evidence, reviewer recomputation, reports and pers
   await page.screenshot({path:'../storage/browser-evidence.png',fullPage:true});
   await page.getByLabel('Review action').selectOption('substitution');
   await page.getByLabel('Evidence / review note').fill('QA reviewer: documented configuration substitution approved for this synthetic test.');
-  await page.getByRole('button',{name:'Save & recompute'}).click();
+  await page.getByRole('button',{name:'Save review'}).click();
   await expect(page.getByRole('dialog')).not.toBeVisible();
+  await expect(page.getByRole('button',{name:'Recompute saved reviews'})).toBeVisible();
+  await page.reload();
+  await expect(page.locator('.pending-reviews')).toContainText('1 saved change');
+  await expect(page.getByRole('button',{name:'PDF report',exact:true})).toBeDisabled();
+  await page.locator('.results-table tbody tr').first().getByRole('button',{name:'Inspect',exact:true}).click();
+  await page.getByLabel('Review action').selectOption('substitution');
+  await page.getByLabel('Evidence / review note').fill('QA reviewer: additional documented substitution detail saved in the same batch.');
+  await page.getByRole('button',{name:'Save review',exact:true}).click();
+  await expect(page.getByRole('dialog')).not.toBeVisible();
+  await expect(page.locator('.pending-reviews')).toContainText('2 saved changes');
+  await page.getByRole('button',{name:'Recompute saved reviews'}).click();
   await expect(page.locator('.run-actions .badge')).toHaveText('auto approvable',{timeout:90000});
+  const recomputed=await request.get(`/api/reconciliations/${runId}`);
+  expect(recomputed.ok()).toBeTruthy();
+  const result=await recomputed.json();
+  expect(result.version).toBe(2);expect(result.pending_review_count).toBe(0);expect(result.policy.applied_review_count).toBe(2);
+  await expect(page.locator('.pending-reviews')).toHaveCount(0);
   await page.reload();
   await expect(page.getByText('QA reviewer: documented configuration substitution approved for this synthetic test.',{exact:false}).first()).toBeVisible();
   for(const label of ['PDF report','CSV','JSON']){

@@ -9,7 +9,7 @@ Open http://127.0.0.1:3000. Start with start-local.cmd if needed.
 5. Expand optimizing allocations for the solver's capacity/split/unallocated plan. Compatible-unit splits can be authorized with a source note; all financial rules are rechecked before ledger commitment.
 6. Expand validating specifications, validating financials and investigating exceptions for source-grounded findings and recommended reviewer actions.
 7. For unclear text, open a document and click Reinspect page with vision. This queues a real worker job/new version. Open recovering source > Vision result for the alternative image reading. It does not silently change canonical values.
-8. Correct wrong fields in the ordinary evidence review panel. In the document canonical rows tab, Confirm extracted fields & recompute records verification after checking the PDF. Numeric/math errors are not waived by verification.
+8. Correct wrong fields in the ordinary evidence review panel. In the document canonical rows tab, Save source verification records verification after checking the PDF. Numeric/math errors are not waived by verification.
 9. Use Include previous result versions to show earlier attempts and outputs. Refresh to demonstrate persisted traces/reviews, then download the genuine PDF/CSV/JSON reports.
 
 First Docling/model initialization may take minutes on this machine. Show real stage progress rather than claiming instantaneous processing. Synthetic performance is not a guarantee for unseen documents. Historical outputs created before trace capture have an explicit legacy notice.
@@ -21,3 +21,12 @@ First Docling/model initialization may take minutes on this machine. Show real s
 - [Reviewed result and reports](http://127.0.0.1:3000/runs/258b2eec-66fd-426c-90fb-6cdbf4acacc9): approved documented synthetic substitution, source evidence and versioned reports.
 
 These are fictional synthetic inputs and retained live execution results. Unresolved cases intentionally show review rather than invented certainty.
+
+
+For table inspection, choose Inspect OCR & extraction > Tables, select a table and click a cell to highlight its source. For old incomplete canonical extraction, Refresh structured rows & recompute rebuilds the saved commercial tables in an audited version. It protects reviewed corrections and committed allocations. The refreshed match results still show genuine quantity, price and specification discrepancies.
+
+
+Discrepancies include failed rule checks and unresolved source information. A missing invoice specification means compliance is unverified, not that the delivered product necessarily fails. Expand a finding and click Audit source lookup to open Finding source audit, inspect the cited PDFs and view the lookup result/metadata. When no specific citation exists, the dialog explicitly shows original documents without highlights. The lookup records source access; it does not rerun the AI or resolve the finding. Request errors appear inside the dialog.
+
+
+Batch human review: inspect each item and choose Save review. Reviews, extraction corrections, split authorizations and source verification persist immediately without starting processing. The run banner shows the saved-change count, including after reload. Use Recompute saved reviews once after completing the batch. One new result version rechecks all saved changes; reports remain disabled while changes are pending. Shared-document edits mark each affected run pending, and each run is recomputed explicitly.

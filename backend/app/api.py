@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 import time
 from datetime import datetime
 from typing import Literal
@@ -72,6 +73,17 @@ def owned(db, model, id, org):
     return value
 
 
+def mark_pending_review(run):
+    policy = run.policy or {}
+    run.policy = {
+        **policy,
+        "pending_review_count": int(policy.get("pending_review_count", 0)) + 1,
+        "pending_since": policy.get("pending_since") or now(),
+        "pending_previous_outcome": policy.get("pending_previous_outcome") or run.outcome,
+    }
+    run.outcome = "REVIEW_REQUIRED"
+
+
 def queue(db, run):
     if run.status in ("QUEUED", "PROCESSING"):
         raise HTTPException(409, "Run is already queued or processing")
@@ -80,6 +92,11 @@ def queue(db, run):
     run.outcome = "INCOMPLETE"
     run.error = None
     run.cancel_requested = 0
+    policy = dict(run.policy or {})
+    policy["applied_review_count"] = policy.pop("pending_review_count", 0)
+    policy.pop("pending_since", None)
+    policy.pop("pending_previous_outcome", None)
+    run.policy = policy
     run.version += 1
     run.started_at = None
     run.finished_at = None
@@ -382,9 +399,11 @@ def run_details(id: str, db=Depends(db_session), org=Depends(auth)):
         serialize(owned(db, Document, d, org))
         for d in [run.po_id] + run.invoice_ids + run.supporting_ids
     ]
+    result["pending_review_count"] = int(run.policy.get("pending_review_count", 0))
     result["report_available"] = (
-        settings.storage / "reports" / run.id / str(run.version) / "report.json"
-    ).exists()
+        not result["pending_review_count"]
+        and (settings.storage / "reports" / run.id / str(run.version) / "report.json").exists()
+    )
     return result
 
 
@@ -506,6 +525,10 @@ def download_report(
     org=Depends(auth),
 ):
     run = owned(db, Run, id, org)
+    if run.policy.get("pending_review_count"):
+        raise HTTPException(
+            409, "Saved reviews are pending. Recompute before downloading the current report."
+        )
     filename = "discrepancies.csv" if format == "csv" else "report." + format
     path = settings.storage / "reports" / id / str(run.version) / filename
     if not path.exists():
@@ -532,6 +555,8 @@ def retry(id: str, db=Depends(db_session), org=Depends(auth)):
 
 @app.post("/api/reconciliations/{id}/recalculate")
 def recalculate(id: str, db=Depends(db_session), org=Depends(auth)):
+    if db.bind.dialect.name == "sqlite":
+        db.execute(text("BEGIN IMMEDIATE"))
     run = owned(db, Run, id, org)
     queue(db, run)
     return serialize(run)
@@ -591,9 +616,13 @@ def review(id: str, body: ReviewRequest, db=Depends(db_session), org=Depends(aut
             note=body.note,
         )
     )
+    mark_pending_review(run)
     db.commit()
-    queue(db, run)
-    return {"match": serialize(match), "run": serialize(run)}
+    return {
+        "match": serialize(match),
+        "run": serialize(run),
+        "pending_review_count": run.policy["pending_review_count"],
+    }
 
 
 @app.post("/api/elements/{id}/correct")
@@ -669,13 +698,10 @@ def correct(id: str, body: CorrectionRequest, db=Depends(db_session), org=Depend
                 note=body.note,
             )
         )
-    db.commit()
     for run in affected:
-        queue(db, run)
-    return {
-        "element": serialize(element),
-        "recalculated_run_ids": [r.id for r in affected],
-    }
+        mark_pending_review(run)
+    db.commit()
+    return {"element": serialize(element), "pending_run_ids": [r.id for r in affected]}
 
 
 @app.post("/api/discrepancies/{id}/investigate")
@@ -690,10 +716,74 @@ def investigate(id: str, db=Depends(db_session), org=Depends(auth)):
         discrepancy.match_id or discrepancy.id,
         org,
     )
+    run = owned(db, Run, discrepancy.run_id, org)
+    doc_ids = [run.po_id] + run.invoice_ids + run.supporting_ids
+    # Prefer explicit finding citations, retaining the linked match's bilateral evidence.
+    result = list(result or []) + list(discrepancy.evidence or [])
+    cited_ids = set(
+        re.findall(r"[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}", discrepancy.message)
+    )
+    request = next(
+        (
+            r
+            for r in run.policy.get("agent_review_requests", [])
+            if r.get("version") == run.version and r.get("reason") == discrepancy.message
+        ),
+        None,
+    )
+    if request and request.get("record_id"):
+        item = db.scalar(
+            select(Line).where(
+                Line.id == request["record_id"],
+                Line.organization_id == org,
+                Line.document_id.in_(doc_ids),
+            )
+        )
+        if item:
+            result.extend(item.evidence)
+    if cited_ids:
+        for element in db.scalars(
+            select(Element).where(
+                Element.id.in_(cited_ids),
+                Element.organization_id == org,
+                Element.document_id.in_(doc_ids),
+            )
+        ):
+            result.append(
+                {
+                    "element_id": element.id,
+                    "document_id": element.document_id,
+                    "page": element.page,
+                    "bbox": element.bbox,
+                    "raw_text": element.raw_text,
+                }
+            )
+    result = list(
+        {
+            (
+                e.get("element_id", e.get("id")),
+                e.get("document_id"),
+                e.get("page"),
+                tuple(e.get("bbox") or []),
+            ): e
+            for e in result
+            if e.get("document_id") in doc_ids
+        }.values()
+    )
     return {
         "finding": serialize(discrepancy),
         "source_evidence": result,
-        "resolution": "Inspect the evidence and submit a documented review or extraction correction.",
+        "documents": [
+            serialize(d)
+            for d in db.scalars(
+                select(Document).where(Document.id.in_(doc_ids), Document.organization_id == org)
+            )
+        ],
+        "run_version": run.version,
+        "citation_status": "SOURCE_CITATIONS_AVAILABLE"
+        if result
+        else "NO_SPECIFIC_SOURCE_CITATION",
+        "resolution": "This lookup displays saved source evidence; it does not rerun AI or resolve the finding. Verify the original PDFs, then submit a documented review or extraction correction.",
     }
 
 
@@ -841,13 +931,37 @@ def event_trace(id: str, event_id: str, db=Depends(db_session), org=Depends(auth
 def extraction_output(id: str, db=Depends(db_session), org=Depends(auth)):
     doc = owned(db, Document, id, org)
     path = settings.storage / "extractions" / (doc.id + ".json")
+    raw = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    from backend.app.table_context import build_tables
+
+    elements = list(
+        db.scalars(
+            select(Element).where(Element.document_id == doc.id, Element.organization_id == org)
+        )
+    )
     return {
         "document_id": doc.id,
         "version": doc.version,
         "metadata": doc.extraction,
-        "raw": json.loads(path.read_text(encoding="utf-8")) if path.exists() else {},
+        "raw": raw,
+        "tables": build_tables(raw, elements),
         "note": "Raw parser output is immutable; canonical corrections are versioned separately.",
     }
+
+
+@app.get("/api/documents/{id}/tables")
+def document_tables(id: str, db=Depends(db_session), org=Depends(auth)):
+    from backend.app.table_context import build_tables
+
+    doc = owned(db, Document, id, org)
+    path = settings.storage / "extractions" / f"{doc.id}.json"
+    raw = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    elements = list(
+        db.scalars(
+            select(Element).where(Element.document_id == doc.id, Element.organization_id == org)
+        )
+    )
+    return {"document_id": doc.id, "version": doc.version, "tables": build_tables(raw, elements)}
 
 
 @app.post("/api/reconciliations/{id}/allocation-review")
@@ -910,8 +1024,8 @@ def allocation_review(
             note=body.note,
         )
     )
+    mark_pending_review(run)
     db.commit()
-    queue(db, run)
     return serialize(run)
 
 
@@ -1021,7 +1135,51 @@ def verify_extraction(
                 note=body.note,
             )
         )
-    db.commit()
     for run in affected:
-        queue(db, run)
-    return {"document": serialize(doc), "requeued_runs": [r.id for r in affected]}
+        mark_pending_review(run)
+    db.commit()
+    return {"document": serialize(doc), "pending_run_ids": [r.id for r in affected]}
+
+
+@app.post("/api/reconciliations/{id}/refresh-tables")
+def refresh_tables(
+    id: str, body: ExtractionVerificationRequest, db=Depends(db_session), org=Depends(auth)
+):
+    from backend.app.extraction import refresh_saved_tables
+
+    db.execute(text("BEGIN IMMEDIATE"))
+    run = owned(db, Run, id, org)
+    if run.version != body.version:
+        raise HTTPException(409, "Result version changed; refresh before rebuilding")
+    doc_ids = [run.po_id] + run.invoice_ids
+    affected = [
+        r
+        for r in db.scalars(select(Run).where(Run.organization_id == org))
+        if set(doc_ids) & set([r.po_id] + r.invoice_ids)
+    ]
+    if any(r.status in {"PROCESSING", "QUEUED"} for r in affected):
+        raise HTTPException(409, "Wait for affected runs to finish before rebuilding tables")
+    output = [refresh_saved_tables(db, owned(db, Document, d, org)) for d in doc_ids]
+    db.add(
+        Review(
+            organization_id=org,
+            run_id=run.id,
+            actor="local_workspace_owner",
+            action="table_extraction_refresh",
+            before={"version": run.version},
+            after={"documents": output},
+            note=body.note,
+        )
+    )
+    db.commit()
+    from backend.app.workflow import emit
+
+    emit(
+        run.id,
+        "EXTRACTING",
+        "TABLES_REFRESHED",
+        "Rebuilt item rows from saved table headers; percentage discounts normalized",
+        {"output": output, "version": run.version},
+    )
+    queue(db, run)
+    return {"documents": output, "run": serialize(run)}

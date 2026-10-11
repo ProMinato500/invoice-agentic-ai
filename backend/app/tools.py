@@ -266,6 +266,22 @@ def dispatch(db, run_id, name, record_id, org, args=None, emit=None):
                     )
                 ],
             }
+            if name == "inspect_extracted_table":
+                import json
+
+                from backend.app.core.config import settings
+                from backend.app.table_context import build_tables
+
+                path = settings.storage / "extractions" / f"{doc.id}.json"
+                raw = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+                sources = list(
+                    db.scalars(
+                        select(Element).where(
+                            Element.document_id == doc.id, Element.organization_id == org
+                        )
+                    )
+                )
+                result["tables"] = [t for t in build_tables(raw, sources) if t["page"] == page]
     else:
         authorized = record_id in [run.id] + docs
         authorized = (

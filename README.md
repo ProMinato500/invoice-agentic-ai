@@ -98,4 +98,4 @@ No payment is initiated. No arbitrary shell, file path or SQL tool is exposed to
 
 ## Inspect execution during a demo
 
-See [demo guide](docs/demo-guide.md). Expand a run stage and click **View output** for OCR, AI/tool decisions, allocation or validation results. **Inspect OCR & extraction** opens source text beside the PDF. Page vision reinspection and reviewer verification create audited result versions.
+See [demo guide](docs/demo-guide.md). Expand a run stage and click **View output** for OCR, AI/tool decisions, allocation or validation results. **Inspect OCR & extraction** opens source text beside the PDF. Page vision reinspection creates an audited result version. Human reviews and source verification save as pending changes; use Recompute saved reviews once to create a new result version for the batch.

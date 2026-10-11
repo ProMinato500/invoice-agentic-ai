@@ -21,3 +21,6 @@ Pagination uses `limit` and `offset`. SSE supports `after` and Last-Event-ID, wi
 - POST /api/reconciliations/{id}/reinspect: {version, document_id, page, bbox?}; queues a real source vision reading/new result version, never a hidden canonical overwrite.
 - POST /api/documents/{id}/verify-extraction: {version, note}; reviewer verification of source-backed canonical fields; leaves math failures intact and recomputes affected runs.
 - POST /api/reconciliations/{id}/allocation-review: {version, pieces:[{invoice_line_id, po_line_id, quantity}], note}; exact compatible-unit splits, scoped IDs, six decimal places, optimistic version checks and full ledger/financial recomputation.
+
+
+Review/correction/allocation/source-verification POSTs now save and audit changes without queuing processing. Run details include pending_review_count; pending runs have REVIEW_REQUIRED outcome and report_available=false. Shared source edits mark dependent runs pending. POST /api/reconciliations/{id}/recalculate atomically queues the saved batch, increments the result version once, clears the pending count and records applied_review_count in policy. Concurrent/stale reviews and duplicate recompute requests remain rejected. Current report downloads return 409 while reviews await recomputation.

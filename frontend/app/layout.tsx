@@ -2,5 +2,5 @@ import type { Metadata } from 'next';
 import './globals.css';
 import Providers from '@/components/providers';
 import Shell from '@/components/shell';
-export const metadata:Metadata={title:'ReconcileAI ? Local workspace',description:'Evidence-backed purchase order and invoice reconciliation'};
+export const metadata:Metadata={title:'ReconcileAI',description:'Evidence-backed purchase order and invoice reconciliation'};
 export default function RootLayout({children}:{children:React.ReactNode}){return <html lang="en"><body><Providers><Shell>{children}</Shell></Providers></body></html>;}

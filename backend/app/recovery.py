@@ -6,6 +6,7 @@ from backend.app.core.config import settings
 from backend.app.models import Element, uid
 from backend.app.normalization import attributes, identifier, number, unit
 from backend.app.schemas import CanonicalLine, RecoveredPage
+from backend.app.table_context import recovery_chunks
 from backend.app.tools import render_region
 
 RECOVERY_TOOLS = {
@@ -13,14 +14,14 @@ RECOVERY_TOOLS = {
     "render_page": "Render the current PDF page for inspection; returns actual image metadata.",
     "crop_region": "Render a bounded region within the current page; returns actual crop metadata.",
     "propose_correction": "Record a source correction proposal for human verification; query is the reason.",
-    "inspect_extracted_table": "Inspect source elements and existing canonical rows on the current document page.",
+    "inspect_extracted_table": "Inspect reconstructed table rows, repeated headers, spans, type hints, identifier links and existing canonical rows for the current chunk.",
     "validate_extraction": "Read deterministic completeness and financial consistency findings.",
     "reinspect_with_vision": "Read a specified page/crop using the configured vision model; preserve the competing reading for review.",
     "request_human_review": "Record unresolved extraction ambiguity; query is the reason.",
 }
 
 
-def quality_gate(document, canonical, elements, header, warnings):
+def quality_gate(document, canonical, elements, header, warnings, tables=None):
     known = {e.id: e for e in elements}
     pages = {known[i].page for row in canonical for i in row.evidence_ids if i in known}
     reasons = []
@@ -30,8 +31,42 @@ def quality_gate(document, canonical, elements, header, warnings):
         suspect.update(range(1, document.page_count + 1))
     for page in range(1, document.page_count + 1):
         text = " ".join(e.raw_text for e in elements if e.page == page)
-        if page not in pages and re.search(
-            r"qty|quantity|unit price|description|sku|amount", text, re.I
+        page_tables = [t for t in (tables or []) if t["page"] == page]
+        only_supporting_tables = bool(page_tables) and all(
+            t["type_hint"] in ("delivery_schedule", "tax_summary", "payment_schedule")
+            for t in page_tables
+        )
+        if only_supporting_tables:
+            rectangles = []
+            for table in page_tables:
+                boxes = [c["bbox"] for c in table["cells"] if c["bbox"]]
+                if boxes:
+                    rectangles.append(
+                        [
+                            min(b[0] for b in boxes),
+                            min(b[1] for b in boxes),
+                            max(b[2] for b in boxes),
+                            max(b[3] for b in boxes),
+                        ]
+                    )
+            outside = " ".join(
+                e.raw_text
+                for e in elements
+                if e.page == page
+                and not any(
+                    e.bbox[0] >= b[0] - 2
+                    and e.bbox[1] >= b[1] - 2
+                    and e.bbox[2] <= b[2] + 2
+                    and e.bbox[3] <= b[3] + 2
+                    for b in rectangles
+                )
+            )
+            if re.search(r"qty|quantity|unit price|description|sku|amount", outside, re.I):
+                only_supporting_tables = False
+        if (
+            page not in pages
+            and not only_supporting_tables
+            and re.search(r"qty|quantity|unit price|description|sku|amount", text, re.I)
         ):
             suspect.add(page)
             reasons.append(f"PAGE_WITH_ITEM_CONTENT_NOT_COVERED:{page}")
@@ -86,7 +121,7 @@ def validate_field(field, known):
     return bool(identifier(field.value)) and identifier(field.value) in identifier(text)
 
 
-def recover(document, canonical, elements, header, quality, emit):
+def recover(document, canonical, elements, header, quality, emit, tables=None):
     alternatives = []
     warnings = []
     targets = quality["suspect_pages"][: settings.max_recovery_pages]
@@ -95,9 +130,21 @@ def recover(document, canonical, elements, header, quality, emit):
     known = {e.id: e for e in elements}
     for page in targets:
         source = [e for e in elements if e.page == page]
-        # Each chunk has its own authorized IDs; later pages never silently disappear.
-        chunks = [source[i : i + 120] for i in range(0, len(source), 120)] or [[]]
-        for chunk_index, chunk in enumerate(chunks):
+        page_tables = [t for t in (tables or []) if t["page"] == page]
+        # Include adjacent-page header evidence for explicitly marked continuation suggestions.
+        inherited_ids = {
+            i
+            for t in page_tables
+            for c in t.get("suggested_headers", [])
+            for i in c["evidence_ids"]
+        }
+        context_elements = source + [
+            e for e in elements if e.id in inherited_ids and e.page != page
+        ]
+        chunks = recovery_chunks(context_elements, page_tables)
+        for chunk_index, bundle in enumerate(chunks):
+            chunk = [e for e in bundle["elements"] if e.page == page or bundle["tables"]]
+            table_context = bundle["tables"]
             supplied = {e.id: e for e in chunk}
             page_rows = [
                 r.model_dump(mode="json")
@@ -117,6 +164,8 @@ def recover(document, canonical, elements, header, quality, emit):
                             {"id": e.id, "text": e.raw_text, "bbox": e.bbox} for e in chunk
                         ],
                         "existing_rows": page_rows,
+                        "tables": table_context,
+                        "document_header": header,
                     }
                 if name in {"render_page", "crop_region"}:
                     rendered = render_region(
@@ -166,6 +215,8 @@ def recover(document, canonical, elements, header, quality, emit):
                         "document_id": document.id,
                         "page": page,
                         "region_evidence_id": region.id,
+                        "tables": table_context,
+                        "document_header": header,
                         "source_elements": [{"id": e.id, "text": e.raw_text} for e in chunk],
                         "instruction": "Read only this image region. Every field must cite supplied source IDs or the region evidence ID. Missing values are null. Never infer prices or totals.",
                     },
@@ -200,7 +251,9 @@ def recover(document, canonical, elements, header, quality, emit):
                             {"id": e.id, "text": e.raw_text, "bbox": e.bbox} for e in chunk
                         ],
                         "existing_rows": page_rows,
-                        "instruction": "Inspect with tools. Use canonical field names exactly: header number/po_reference/supplier/buyer/currency/subtotal/tax/freight/discount/total; item description/sku/quantity/unit/unit_price/amount/tax_rate/discount. Header fields must not be item rows. Extract only this chunk's actual rows and header fields. Each field requires its own supporting IDs. Use null for absent values. Include existing rows unchanged when supported; preserve competing readings. No inferred row amounts.",
+                        "tables": table_context,
+                        "document_header": header,
+                        "instruction": "Inspect with tools. Use canonical field names exactly: header number/po_reference/supplier/buyer/currency/subtotal/tax/freight/discount/total; item description/sku/quantity/unit/unit_price/amount/tax_rate/discount. Header fields must not be item rows. Use table title, header hierarchy, row boundaries and spans before interpreting values. Classify unknown tables using tools or vision. Table type hints are advisory. Never create priced item rows from delivery schedules, tax summaries or payment schedules, and never use delivery quantities as ordered/billed quantities. Join related tables only through explicit line/material identifiers; ambiguity requires review. Suggested continuation headers are unverified and require vision or review. Extract only this chunk's actual rows and header fields. Each field requires its own supporting IDs. Use null for absent values. Include existing rows unchanged when supported; preserve competing readings. No inferred row amounts.",
                     },
                     RecoveredPage,
                     RECOVERY_TOOLS,
@@ -229,7 +282,19 @@ def recover(document, canonical, elements, header, quality, emit):
                         header[field.name] = field.value
                     elif str(header[field.name]) != field.value:
                         warnings.append("CONFLICTING_HEADER_" + field.name.upper())
+                forbidden_ids = {
+                    i
+                    for t in table_context
+                    if t["type_hint"] in ("delivery_schedule", "tax_summary", "payment_schedule")
+                    for r in t["rows"]
+                    for c in r["cells"]
+                    for i in c["evidence_ids"]
+                }
                 for row in result.rows:
+                    cited = set(row.evidence_ids) | {i for f in row.fields for i in f.evidence_ids}
+                    if cited & forbidden_ids:
+                        warnings.append("NON_ITEM_TABLE_ROW_REJECTED")
+                        continue
                     fields = {f.name: f for f in row.fields}
                     if any(
                         k not in fields or fields[k].value is None
