@@ -228,11 +228,13 @@ Start the application before running Playwright. Generate fresh browser fixtures
 Set-Location frontend
 $env:PLAYWRIGHT_BROWSERS_PATH = Join-Path (Get-Location) '..\.cache\playwright'
 npx.cmd playwright install chromium
-npm.cmd run test:e2e
+npm.cmd run test:e2e -- local-flow.spec.ts
 Set-Location ..
 ```
 
-These workflows use the running services and may create persisted fictional runs. Tests exercising generative AI require working credentials and may incur provider usage. Model downloads and cold initialization can lengthen execution.
+The `local-flow.spec.ts` workflow creates its own run from the generated browser fixtures. To run the entire suite with `npm.cmd run test:e2e`, first complete sample runs that supply OCR/table evidence, discrepancies, and a matched PO item on page 2 or later. The audit, trace, table and linked-page tests inspect existing run history; a newly initialized empty database does not meet those prerequisites.
+
+Browser checks use the running services and may create persisted fictional runs. Tests exercising generative AI require working credentials and may incur provider usage. Model downloads and cold initialization can lengthen execution.
 
 ### Sample PDFs and evaluation
 
@@ -240,7 +242,23 @@ These workflows use the running services and may create persisted fictional runs
 .\.venv\Scripts\python.exe -m synthetic_data generate --all --seed 42
 ```
 
-Generated inputs live under `synthetic_data/generated/`. Once an invoice has committed allocations, repeating it can correctly trigger duplicate or remaining-capacity findings. Use fresh identifiers for repeated live demos, or the isolated benchmark route at **http://127.0.0.1:3000/evaluation**. Evaluation is available directly but is not in the main sidebar. Ground truth is read after inference; synthetic results are not a guarantee for unseen PDFs.
+The **generator is included in Git**, but generated PDFs and ground truth under `synthetic_data/generated/` are Git-ignored. A fresh clone creates them through `setup-local.cmd` or the generation command above; the local sample files are not already bundled in the GitHub checkout. The default generation creates 15 scenarios plus 12 layout variants, each with `purchase_order.pdf`, `invoice.pdf`, a manifest and evaluation metadata.
+
+| Example | Generated folder | Intended demonstration |
+| --- | --- | --- |
+| Happy path | `synthetic_data/generated/happy_path/` | Correspondence and financial checks that should pass for a fresh ledger. |
+| Specification mismatch | `synthetic_data/generated/specification_mismatch/` | A printed technical requirement conflict. |
+| Price mismatch | `synthetic_data/generated/price_mismatch/` | Price outside the allowed tolerance. |
+| Partial invoice | `synthetic_data/generated/partial_invoice/` | Billing less than the ordered quantity. |
+| Quantity overbilling | `synthetic_data/generated/quantity_overbilling/` | Billing beyond ordered capacity. |
+| Scanned documents | `synthetic_data/generated/scanned/` | OCR rather than native text extraction. |
+| Multi-page documents | `synthetic_data/generated/multi_page/` | Items and evidence across pages. |
+
+Other scenarios cover extra items, totals, currency, missing specifications, model differences, semantic aliases, ambiguity and larger inputs. Layout variants include borderless, landscape and continued-table examples. Intended scenarios are test inputs, not guarantees of every model's outcome.
+
+The separate `scripts/browser_fixtures.py` command creates a fresh PO/invoice pair in `storage/browser-fixtures/` for the upload browser test. That directory is also generated and Git-ignored.
+
+Once an invoice has committed allocations, repeating it can correctly trigger duplicate or remaining-capacity findings. Use fresh identifiers for repeated live demos, or the isolated benchmark route at **http://127.0.0.1:3000/evaluation**. Evaluation is available directly but is not in the main sidebar. Ground truth is read after inference; synthetic results are not a guarantee for unseen PDFs.
 
 For the case-study recording, show a **happy path and at least one edge case running live** within five minutes. Explain processing using the portal's timeline and outputs; the candidate guide asks for **no slides**.
 
