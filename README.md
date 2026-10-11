@@ -1,101 +1,286 @@
-# ReconcileAI - local purchase order / invoice reconciliation
+# ReconcileAI
 
-A local Next.js + FastAPI application that processes real PDF files, persists documents and results in SQLite, uses Docling with RapidOCR, and invokes your configured Azure/OpenAI model for uncertain layouts and product correspondence. Monetary calculations use Python Decimal. LangGraph checkpoints, workflow events and reviewer actions are persisted.
+**AI-assisted purchase order and invoice reconciliation, with inspectable source evidence and audited human review.**
 
-This implementation follows the supplied brief with the user's explicit **local-first** adjustment: no Docker, Redis, PostgreSQL server or deployment is required. The application is a single-user local workspace, not a deployed multi-tenant SaaS.
+ReconcileAI accepts real PDF documents, extracts their contents, maps invoice items to purchase-order items, and produces a reasoned result. The portal shows live processing stages, source highlights, discrepancies, saved reviews and downloadable reports.
 
-## Start on this machine
+This repository provides a **local, single-user application**. The frontend, API, worker, OCR, embedding encoder and persistence run locally. Generative AI requests use your configured Azure OpenAI or OpenAI provider. No Docker, Redis or PostgreSQL service is required.
 
-Dependencies and the production frontend have already been installed/built in this workspace.
+## Contents
+
+- [What it does](#what-it-does)
+- [Quick start](#quick-start)
+- [Configuration](#configuration)
+- [Using the portal](#using-the-portal)
+- [Architecture and processing](#architecture-and-processing)
+- [Repository structure](#repository-structure)
+- [Testing and demo inputs](#testing-and-demo-inputs)
+- [Troubleshooting](#troubleshooting)
+- [Scope and limitations](#scope-and-limitations)
+- [Further documentation](#further-documentation)
+
+## What it does
+
+- Extracts PDF layout and tables with **Docling**, using **RapidOCR** for scanned content.
+- Retains table headers, cell positions, spans and source regions alongside canonical item fields.
+- Retrieves PO candidates using identifiers, SQLite FTS5, fuzzy matching and local dense embeddings.
+- Uses bounded AI roles for extraction recovery, product matching, specification assessment and exception investigation.
+- Separates product correspondence, specification compliance, quantity allowance and price checks.
+- Proposes capacity-compatible allocations with **OR-Tools** and validates financial values with **Decimal** arithmetic.
+- Streams persisted workflow events through **SSE**, with clickable OCR, tool, solver and validation outputs.
+- Saves human reviews and corrections immediately, then recomputes the saved batch through one explicit action.
+- Generates versioned **PDF, CSV and JSON reports**, retaining original documents and prior artifacts.
+
+## Quick start
+
+### Prerequisites
+
+| Requirement | Notes |
+| --- | --- |
+| Windows with PowerShell or Command Prompt | Included setup/start/stop scripts target Windows. |
+| Python 3.13 | Version used by `setup-local.cmd` and verified for this project. |
+| Node.js 24 and npm | Verified runtime. Node 20.9+ is the intended minimum, but other versions have not been validated here. |
+| uv | Used by the automatic setup script; a pip-based alternative is below. |
+| Network access | Needed for package/model downloads and generative AI calls. Models are cached after download. |
+| Azure OpenAI or OpenAI access | Required to exercise the full AI workflow. Local embeddings do not require an API key. |
+
+Clone or download this repository, open a terminal in its root directory, and run:
+
+```powershell
+.\setup-local.cmd
+```
+
+Setup creates `.venv`, installs locked Python and frontend dependencies, creates `.env` from `.env.example` if missing, applies migrations, generates fictional test PDFs, copies the PDF.js worker and builds the frontend. It preserves an existing `.env`.
+
+Open `.env` privately and configure **one** generative AI provider as described below, then start the application:
 
 ```powershell
 .\start-local.cmd
 ```
 
-Open **http://127.0.0.1:3000**. API documentation is at **http://127.0.0.1:8010/docs**. Port 8010 avoids the existing application on port 8000. The launcher starts the API, durable local worker and frontend in hidden processes. Logs are in `storage/logs/`.
+| Service | Default URL |
+| --- | --- |
+| Portal | http://127.0.0.1:3000 |
+| API documentation | http://127.0.0.1:8010/docs |
+| API health | http://127.0.0.1:8010/health |
+| Runtime readiness | http://127.0.0.1:8010/ready |
+
+The launcher starts the API, durable worker and frontend in background processes. Logs are written to `storage/logs/`. First-use model initialization can take several minutes, especially for scanned PDFs.
+
+Stop the application with:
 
 ```powershell
 .\stop-local.cmd
 ```
 
-The stop command verifies executable arguments, workspace directory, PID and process creation time. It stops only processes started by this launcher. No database or uploaded document is deleted. To use development mode, run `start-local.cmd --dev`.
+Stopping preserves the database and uploaded files. The launcher checks process identity before stopping its own services.
 
-## Fresh setup
-
-Python 3.13 (the version verified here), Node.js 24 and uv are required. Python 3.12+ and Node 20.9+ are the intended minimums, but other combinations have not been verified.
+For frontend development, use:
 
 ```powershell
-.\setup-local.cmd
-.\start-local.cmd
+.\start-local.cmd --dev
 ```
 
-Setup creates `.venv`, installs the resolved Python dependency lock, runs non-destructive Alembic migrations, generates real test PDFs, installs frontend dependencies from `package-lock.json`, copies the matching PDF.js worker and builds Next.js. It does not overwrite an existing `.env`.
+### Manual setup without uv
 
-Manual setup is available if uv is unavailable:
+Run from the repository root with Python 3.13 available:
 
 ```powershell
 python -m venv .venv
-.venv\Scripts\python.exe -m pip install -r requirements.lock
-.venv\Scripts\python.exe -m alembic upgrade head
-.venv\Scripts\python.exe -m synthetic_data generate --all --seed 42
-cd frontend
+.\.venv\Scripts\python.exe -m pip install -r requirements.lock
+if (-not (Test-Path -LiteralPath .env)) { Copy-Item -LiteralPath .env.example -Destination .env }
+.\.venv\Scripts\python.exe -m alembic upgrade head
+.\.venv\Scripts\python.exe -m synthetic_data generate --all --seed 42
+Set-Location frontend
 npm.cmd ci --cache ..\.cache\npm
-New-Item -ItemType Directory -Force public
-Copy-Item node_modules\pdfjs-dist\build\pdf.worker.min.mjs public\pdf.worker.min.mjs
+New-Item -ItemType Directory -Force public | Out-Null
+Copy-Item -LiteralPath node_modules\pdfjs-dist\build\pdf.worker.min.mjs -Destination public\pdf.worker.min.mjs
 npm.cmd run build
-cd ..
-.\start-local.cmd
+Set-Location ..
 ```
 
-Use `npm.cmd` on Windows to avoid blocked `npm.ps1` execution policies. The `.cmd` launchers do not require changing PowerShell execution policy.
-
-## Workflow
-
-1. Select **New reconciliation** and upload a PO, one or more invoices and optional supporting PDFs, or load PDFs from the synthetic library.
-2. Set the deterministic unit-price tolerance and start reconciliation.
-3. Follow real extraction/indexing/matching/validation/report events. First use initializes Docling's CPU models; scanned pages take longer than native PDFs.
-4. Inspect the paginated line results. Correspondence, specification, quantity and price are independent statuses.
-5. Open **Inspect** to view the original PDFs with actual extracted source rectangles. Review a mapping, choose an alternative, mark unmatched, document an authorized substitution, or correct a canonical extraction field.
-6. Saving a review writes an audit event, versions the result and queues recomputation. A substitution never bypasses price, total or quantity checks.
-7. Download real PDF, CSV and JSON reports. Run history and corrections persist after restart.
-8. Execute a synthetic benchmark in **Evaluation**. Ground truth is loaded only after each inference run finishes. Benchmark allocations are isolated from the normal billing ledger.
-
-A full invoice already allocated against a PO will make later invoices exceed remaining capacity. Loading another synthetic scenario against the same PO does not reset the ledger. Use **Evaluation** for isolated scenario comparison.
+Configure your private `.env`, then run `start-local.cmd`. Use `npm.cmd` on Windows if PowerShell blocks `npm.ps1`.
 
 ## Configuration
 
-Existing `INVOICE_AZURE_ENDPOINT`, `INVOICE_AZURE_API_KEY` and `INVOICE_AZURE_DEPLOYMENT` are supported through the official OpenAI SDK and Azure's v1 Responses endpoint. Alternatively set `OPENAI_API_KEY` and `OPENAI_MODEL`. Credentials stay on the server and are excluded from source control. Missing credentials are disclosed; ambiguous items remain review-required.
+[.env.example](.env.example) contains configuration names and safe defaults. All API keys, endpoints specific to your account, deployment names and tokens are blank. Put your own values only in `.env`; `.env` and other `.env.*` files are ignored by Git, while `.env.example` is retained.
 
-`PARSER=docling` and `DOCLING_PIPELINE=standard` select the full layout/table/OCR pipeline. `PARSER=pymupdf` is an explicitly labeled native PDF parser option used for deterministic offline integration tests; it is not silently substituted for Docling. The local application uses Docling by default.
+### Choose one AI provider
 
-The local matcher uses exact identifiers, SQLite FTS5 lexical retrieval, RapidFuzz and reciprocal-rank fusion. Optional OpenAI embeddings are stored as provenance-bearing vectors and compared exactly in the same SQLite-backed application; no additional vector database is used. Embeddings are **disabled by default** because an Azure chat deployment is not an embedding deployment. To enable them, supply an OpenAI key and set `ENABLE_EMBEDDINGS=true`. The embedding path has not been live-verified in this session.
+| Provider | Fill in your private `.env` |
+| --- | --- |
+| OpenAI | `OPENAI_API_KEY`; set `OPENAI_MODEL` and `OPENAI_VISION_MODEL` to models available to your account. `OPENAI_BASE_URL` is optional. |
+| Azure OpenAI | `INVOICE_AZURE_ENDPOINT`, `INVOICE_AZURE_API_KEY` and `INVOICE_AZURE_DEPLOYMENT`. Use your resource's base endpoint and actual deployment name. |
 
-Set `API_PORT` / `FRONTEND_PORT` if ports are occupied. Rebuild after changing frontend routing configuration. If changing the frontend port, update `CORS_ORIGINS`. `API_TOKEN` optionally enables bearer-token authentication; enter that token under **Settings** for the current browser session. Bindings remain loopback-only.
+The Azure client appends `/openai/v1/` to the resource endpoint. Use a deployment supporting the application's Responses, structured-output and tool-calling workflow; source vision also requires image support. If both providers have credentials, the implementation selects OpenAI first.
 
-## Synthetic PDFs and tests
+With credentials unset, uploads, persistence and deterministic paths remain available, but ambiguous cases cannot use the full AI workflow and may require review. Credentials are read server-side, not passed to frontend environment variables.
 
-```powershell
-.venv\Scripts\python.exe -m synthetic_data generate --all --seed 42
-.venv\Scripts\python.exe -m synthetic_data generate --scenario specification_mismatch --seed 42
-.venv\Scripts\python.exe -m synthetic_data generate --scenario large_document --po-lines 5000 --invoice-lines 3000 --seed 42
-.venv\Scripts\python.exe -m pytest -q
-cd frontend
-$env:PLAYWRIGHT_BROWSERS_PATH = Join-Path (Get-Location) '..\.cache\playwright'
-npx.cmd playwright install chromium
-cd ..
-.venv\Scripts\python.exe scripts\browser_fixtures.py
-cd frontend
-npm.cmd run test:e2e
+### Main options
+
+| Setting | Template default | Purpose |
+| --- | --- | --- |
+| `DATABASE_URL` | `sqlite:///./storage/reconcile.db` | Local application database. |
+| `STORAGE_PATH` | `./storage` | Originals, cached models, checkpoints, logs and reports. |
+| `PARSER` / `DOCLING_PIPELINE` | `docling` / `standard` | Layout, table and OCR extraction. |
+| `ENABLE_EMBEDDINGS` | `true` | Enable dense candidate retrieval. |
+| `EMBEDDING_PROVIDER` | `local` | Use the locally cached MiniLM encoder without a provider embedding key. |
+| `DEFAULT_PRICE_TOLERANCE_PERCENT` | `2` | Initial unit-price tolerance; selectable when creating a run. |
+| `ROUNDING_TOLERANCE` | `0.02` | Monetary rounding allowance used by validation. |
+| `MAX_UPLOAD_MB` / `MAX_PAGES` | `50` / `500` | Input limits; these are not performance guarantees. |
+| `MAX_AI_REQUESTS_PER_RUN` / `MAX_AGENT_TOOL_CALLS` | `48` / `24` | Bounds on model requests and dispatched tools. |
+| `MAX_AI_TOKENS_PER_RUN` | `180000` | Consumed-token budget checked between requests, not a monetary spending cap. |
+| `MAX_RECOVERY_PAGES` | `24` | Bounds source recovery work. |
+| `API_PORT` / `FRONTEND_PORT` | `8010` / `3000` | Launcher ports. |
+| `API_TOKEN` | Empty | Keep empty for the standard local portal; there is no login/token-entry UI. |
+
+Local embeddings download `sentence-transformers/all-MiniLM-L6-v2` on first use and cache it under `storage/model-cache/embeddings/`. For provider embeddings, change `EMBEDDING_PROVIDER` to `provider` and configure an appropriate embedding model. Azure embeddings require `AZURE_EMBEDDING_DEPLOYMENT`; a chat deployment alone is insufficient.
+
+Restart the application after backend configuration changes. If changing the frontend port, update `CORS_ORIGINS`. If changing the API port, rebuild the frontend with `RECONCILE_API_ORIGIN` set to the corresponding API URL so its `/api` rewrite targets the correct service.
+
+## Using the portal
+
+1. Open **New reconciliation** and upload a PO, one or more invoices, and optional supporting PDFs. The synthetic library can load fictional example documents through the same ingestion path.
+2. Set the price tolerance and select **Start reconciliation**.
+3. Follow the persisted execution timeline. Expand a stage and choose **View output** to inspect actual extraction, AI/tool, allocation or validation results.
+4. Use **Inspect OCR & extraction** to browse OCR text, reconstructed tables, canonical rows and parser metadata. Clicking linked text or a cell highlights its source region.
+5. Read the separate correspondence, specification, quantity and price statuses. Expand discrepancies; **Audit source lookup** opens available citations and explicitly identifies missing citation coverage.
+6. Use **Inspect** to compare the invoice and PO. Save a mapping review, correction or documented authorization with a note.
+7. Save all intended reviews first. They persist immediately and increment the pending-change count; saving does **not** queue a new run. Current report downloads are disabled while changes are pending.
+8. Click **Recompute saved reviews** once. The batch creates one new result version and reruns checks. Shared-document corrections can mark several runs pending; recompute each affected run explicitly.
+9. Download PDF, CSV or JSON reports after processing completes. Earlier trace/report artifacts and reviewer history are retained.
+
+A quantity pass means the invoice fits the **remaining ordered allowance**, allowing partial billing; it does not prove delivery. Accepting a product correspondence does not automatically waive specification or financial failures. Discrepancies include both confirmed rule failures and missing evidence.
+
+## Architecture and processing
+
+```text
+Next.js portal -> FastAPI -> SQLite queued run
+                             |
+                       Local worker + LangGraph
+                             |
+Extract -> Index -> Match -> Allocate -> Specifications -> Financial policy
+   |                                                        |
+Source recovery                              Exception investigation / revalidation
+                             |
+                      Versioned reports + result
+                             |
+                  Persisted events -> SSE -> portal
 ```
 
-The browser test needs the running API/worker/frontend. It creates unique fictional PDF inputs, uploads them, checks SSE replay, displays evidence, approves a documented synthetic substitution, recomputes, downloads reports and refreshes history. Unit/integration tests create isolated temporary databases and do not alter workspace data. See `docs/implementation-status.md` for actual verified results and limitations.
+| Layer | Implementation |
+| --- | --- |
+| Portal | Next.js, React, TypeScript, React Query and PDF.js. |
+| API / data | FastAPI, Pydantic, SQLAlchemy, Alembic and SQLite/WAL. |
+| Workflow | A separate OS-locked local worker and LangGraph with SQLite checkpoints. |
+| Extraction | Docling, RapidOCR, PyMuPDF source geometry and canonical normalization. |
+| Retrieval | Identifiers, SQLite FTS5, RapidFuzz, MiniLM vectors and reciprocal-rank fusion. |
+| AI | Four bounded roles with versioned prompts, scoped tools, typed outputs and source validation. |
+| Decision checks | OR-Tools capacity proposals and Decimal-based financial/specification policy. |
+| Observability | Persisted events, public trace payloads, SSE replay and reviewer audits. |
 
-## Boundaries
+AI interprets evidence; numerical and approval policy remain explicit services. Only qualifying ordinary results commit billing allocations. Exception investigation cannot override financial failures. Original PDFs and raw parser readings remain preserved when human corrections change canonical fields.
 
-The full research brief is broader than this local implementation. Unverified equivalence is never assumed. Complex bundles/split allocations, automated amendment precedence, goods-receipt approval, inclusive/mixed-tax interpretation, authorized FX, cancellation/revision policies, conditional/certification standards, learned ranking, all corruption variants and 5000-line performance gates are not certified. Supporting PDFs are retained for human inspection and trigger review rather than silently authorizing changed terms. The current generated product catalog focuses on IT configurations; template names do not certify domain coverage.
+## Repository structure
 
-No payment is initiated. No arbitrary shell, file path or SQL tool is exposed to the AI. This is a functioning local review application, not a claim of universal extraction accuracy or production SaaS readiness.
+```text
+backend/             FastAPI, extraction, agents, workflow and validation
+  app/               Application modules
+  migrations/        Alembic schema migrations
+  tests/             Backend unit and integration tests
+frontend/            Next.js portal and Playwright workflows
+synthetic_data/      Fictional PDF generation and scenario manifests
+evaluation/          Isolated synthetic benchmarks
+scripts/             Local launcher, verification and demo-input utilities
+docs/                API, architecture, data model and implementation notes
+.env.example         Public configuration template with blank credentials
+setup-local.cmd      Dependency installation, migrations and frontend build
+start-local.cmd      Start the local services
+stop-local.cmd       Stop only launcher-owned services
+storage/             Generated runtime data; ignored by Git
+```
 
-## Inspect execution during a demo
+## Testing and demo inputs
 
-See [demo guide](docs/demo-guide.md). Expand a run stage and click **View output** for OCR, AI/tool decisions, allocation or validation results. **Inspect OCR & extraction** opens source text beside the PDF. Page vision reinspection creates an audited result version. Human reviews and source verification save as pending changes; use Recompute saved reviews once to create a new result version for the batch.
+### Backend checks
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q
+.\.venv\Scripts\ruff.exe check backend synthetic_data evaluation scripts
+```
+
+Backend tests use isolated temporary databases rather than the normal workspace ledger. See [implementation status](docs/implementation-status.md) for recorded verification and its limits.
+
+### Frontend build
+
+```powershell
+Set-Location frontend
+npm.cmd run build
+Set-Location ..
+```
+
+### Browser workflow checks
+
+Start the application before running Playwright. Generate fresh browser fixtures from the root, then run:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\browser_fixtures.py
+Set-Location frontend
+$env:PLAYWRIGHT_BROWSERS_PATH = Join-Path (Get-Location) '..\.cache\playwright'
+npx.cmd playwright install chromium
+npm.cmd run test:e2e
+Set-Location ..
+```
+
+These workflows use the running services and may create persisted fictional runs. Tests exercising generative AI require working credentials and may incur provider usage. Model downloads and cold initialization can lengthen execution.
+
+### Sample PDFs and evaluation
+
+```powershell
+.\.venv\Scripts\python.exe -m synthetic_data generate --all --seed 42
+```
+
+Generated inputs live under `synthetic_data/generated/`. Once an invoice has committed allocations, repeating it can correctly trigger duplicate or remaining-capacity findings. Use fresh identifiers for repeated live demos, or the isolated benchmark route at **http://127.0.0.1:3000/evaluation**. Evaluation is available directly but is not in the main sidebar. Ground truth is read after inference; synthetic results are not a guarantee for unseen PDFs.
+
+For the case-study recording, show a **happy path and at least one edge case running live** within five minutes. Explain processing using the portal's timeline and outputs; the candidate guide asks for **no slides**.
+
+## Troubleshooting
+
+| Symptom | What to check |
+| --- | --- |
+| Missing `.venv` or frontend build | Run `setup-local.cmd`, or use the manual setup steps. |
+| Port already occupied | Stop your existing ReconcileAI launcher session or choose free ports. The launcher does not stop unrelated applications. |
+| Slow first extraction | Model initialization/downloads can take minutes. Check `storage/logs/worker.log` and real timeline events. |
+| AI not configured / request failure | Check your private provider settings, deployment capabilities, network access and API/worker logs. |
+| Embeddings cannot download | Check network access and model cache. Disabling `ENABLE_EMBEDDINGS` removes the dense path; identifier/lexical/fuzzy retrieval remains. |
+| Saving reviews does not start processing | Expected behavior: click **Recompute saved reviews** after completing the batch. |
+| Report downloads disabled | Pending changes or unfinished processing prevent a fresh report from being available. |
+| Duplicate / capacity finding on repeated demo | Previously qualifying invoices retain allocations. Use fresh demo identities or isolated evaluation. |
+| Browser cannot reach API after a port change | Check `RECONCILE_API_ORIGIN`, rebuild the frontend and restart the launcher. |
+
+Default-port health checks can also be run with:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\verify_local.py
+```
+
+## Scope and limitations
+
+- This is a local, single-user delivery; there is no account/login workflow or deployed multi-tenant service.
+- Generative AI requires provider access. Cached local OCR/embeddings do not make generative inference offline.
+- Unreadable, ambiguous or incomplete evidence remains reviewable; arbitrary unseen PDFs are not guaranteed to extract correctly.
+- Supporting receipts, specifications and amendments are retained for inspection, but their policy effects are not automatically adopted.
+- Arbitrary bundles, unsupported unit conversions, amendment precedence, goods-receipt approval, FX, credit notes and complex tax treatment require additional verification/policy work.
+- Compatible-unit allocation proposals and reviewed splits exist; they are not universal bundle reconciliation.
+- No payments are initiated. An auto-approvable result means the implemented checks passed, not proof of delivery or authorization to execute a payment.
+
+## Further documentation
+
+- [Architecture](docs/architecture.md)
+- [Agent roles and tools](docs/agent-tools.md)
+- [API reference](docs/api.md)
+- [Data model](docs/data-model.md)
+- [Synthetic data](docs/synthetic-data.md)
+- [Testing](docs/testing.md)
+- [Edge cases](docs/edge-cases.md)
+- [Implementation status and recorded verification](docs/implementation-status.md)
